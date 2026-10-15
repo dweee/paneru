@@ -4,7 +4,7 @@
   inputs = {
     flake-parts.url = "github:hercules-ci/flake-parts";
     import-tree.url = "github:vic/import-tree";
-    nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
     crane.url = "github:ipetkov/crane";
     nix-darwin = {
       url = "github:nix-darwin/nix-darwin/master";
@@ -18,7 +18,7 @@
       { lib, self, ... }:
       {
         imports = [ (inputs.import-tree ./nix) ];
-        systems = lib.platforms.darwin;
+        systems = [ "aarch64-darwin" ];
         flake = {
           overlays.default = final: prev: {
             paneru = self.packages.aarch64-darwin.default;

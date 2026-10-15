@@ -69,8 +69,8 @@ pub(crate) use triggers::apply_config_side_effects;
 /// * `app` - The Bevy application to register the systems with.
 #[allow(clippy::too_many_lines)]
 pub fn register_systems(app: &mut bevy::app::App) {
-    const CLOSED_WINDOW_CHECK_FREQ: Duration = Duration::from_secs(1);
-    const LOW_POWER_MODE_CHECK: Duration = Duration::from_mins(1);
+    const CLOSED_WINDOW_CHECK_FREQ: Duration = Duration::from_millis(1000);
+    const LOW_POWER_MODE_CHECK: Duration = Duration::from_secs(60);
     const APP_OBSERVABILITY_CHECK_FREQ: Duration = Duration::from_millis(200);
 
     let not_swiping = |scrolling: Query<&Scrolling, With<ActiveWorkspaceMarker>>| {
@@ -626,8 +626,6 @@ pub(crate) fn rewatch_configs(
 }
 
 pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<BevyApp> {
-    crate::manager::app::bound_ax_messaging_timeout()?;
-
     let window_manager: Box<dyn WindowManagerApi> = Box::new(WindowManagerOS::new(sender.clone()));
 
     // Discover (or create) the Lua init script first: whether it exists decides

@@ -8,3 +8,16 @@ CLAUDE.md
 .direnv
 **/.DS_Store
 flamegraph.svg
+
+# Local operator artifacts
+/VALIDATION.json
+/PROVENANCE.json
+/provenance.json
+/FORK.json
+/UPSTREAM.json
+/.codex/
+/.cursor/
+/.claude/
+/chat-history/
+/chat-histories/
+/*.jsonl

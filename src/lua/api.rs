@@ -753,12 +753,10 @@ fn config_to_lua_table(lua: &Lua, config: &Config) -> mlua::Result<Table> {
     swipe.set("gesture", gesture)?;
 
     let ScrollOptions {
-        window_step: _,
         modifier: _,
         vertical_modifier: _,
     } = ScrollOptions::default();
     let scroll = lua.create_table()?;
-    scroll.set("window_step", config.swipe_scroll_window_step())?;
     scroll.set("modifier", format_modifiers(config.swipe_scroll_modifier()))?;
     scroll.set(
         "vertical_modifier",

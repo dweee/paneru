@@ -5,12 +5,11 @@ use bevy::MinimalPlugins;
 use bevy::app::App as BevyApp;
 use bevy::app::{First, Last, PostUpdate, PreUpdate, Startup};
 use bevy::ecs::hierarchy::ChildOf;
-use bevy::ecs::lifecycle::RemovedComponents;
 use bevy::ecs::query::{Added, Changed, With};
 use bevy::ecs::resource::Resource;
 use bevy::ecs::schedule::SystemCondition;
-use bevy::ecs::schedule::common_conditions::{not, resource_exists};
-use bevy::ecs::schedule::{ScheduleLabel as _, SingleThreadedExecutor};
+use bevy::ecs::schedule::common_conditions::{not, resource_changed, resource_exists};
+use bevy::ecs::schedule::{ScheduleLabel as _, SingleThreadedExecutor, SystemSet};
 use bevy::ecs::system::{Commands, EntityCommands, Query, Res, SystemId};
 use bevy::prelude::Event as BevyEvent;
 use bevy::tasks::Task;
@@ -36,7 +35,6 @@ use crate::lua;
 use crate::manager::{
     Application, Origin, ProcessApi, Size, Window, WindowManager, WindowManagerApi, WindowManagerOS,
 };
-use crate::menubar::MenuBarManager;
 use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 
@@ -59,6 +57,62 @@ pub mod workspace;
 // same menubar/passthrough side effects as a TOML reload.
 #[cfg(feature = "lua")]
 pub(crate) use triggers::apply_config_side_effects;
+
+/// Deterministic execution phases for the [`PreUpdate`] schedule.
+///
+/// Bevy's topological sort breaks ties between unconstrained systems using its
+/// internal node-insertion order, and `DagGroups::flatten` uses `swap_remove`
+/// whenever a system tuple carries a `.run_if(...)` condition (creating an
+/// anonymous set). Codifying explicit phase sets guarantees that adding or
+/// modifying a `.run_if(...)` anywhere in the schedule can never permute
+/// unrelated systems.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PreUpdateSet {
+    /// Answer pending Lua queries from the previous frame and pump OS events.
+    Pump,
+    /// Split high-rate pointer/gesture events out of `Messages<Event>` before
+    /// command and trigger readers iterate the main queue.
+    Demux,
+    /// Process commands, display changes, and window creation events pumped this
+    /// frame.
+    Dispatch,
+}
+
+/// Deterministic execution phases for the [`Update`] schedule.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub enum UpdateSet {
+    /// Pointer and touchpad gesture handling (`MouseEventsPlugin`,
+    /// `ScrollEventsPlugin`).
+    Input,
+    /// OS event triggers, external window move/resize frame sync, and workspace
+    /// switching / cleanup handlers.
+    Events,
+    /// Startup and runtime process/application/window spawning, default sizing,
+    /// floating-rule classification, and initial workspace strip population.
+    Spawn,
+    /// Focus event handling and focus-driven window size verification.
+    Focus,
+    /// Workspace visibility restoration (`show_active_workspace`). Runs after
+    /// `Events`, `Spawn`, and `Focus` have flushed any `ActiveWorkspaceMarker`
+    /// additions, and before `Layout` so newly unparked strips have their
+    /// on-screen `Position` before window layout positions are computed.
+    Workspace,
+    /// Tiling layout calculation (`LayoutEventsPlugin`).
+    Layout,
+    /// Timers, marker cleanup, state persistence, and Lua event forwarding.
+    Housekeeping,
+}
+
+/// Deterministic execution phases for the [`PostUpdate`] schedule.
+#[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PostUpdateSet {
+    /// Interpolate and commit window positions and sizes to the OS.
+    Animate,
+    /// Update dim overlays, flash messages, mouse-follows-focus, and menu bar.
+    Ui,
+    /// Clean up destroyed workspaces, save preferences, and broadcast state.
+    Bookkeeping,
+}
 
 /// Registers the Bevy systems for the `WindowManager`.
 /// This function adds various systems to the `Update` schedule, including event dispatchers,
@@ -98,15 +152,40 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 || !workspace_changed.is_empty()
                 || !focused_moved.is_empty()
         };
-    // The menu bar additionally shows how many virtual workspaces exist, so it
-    // has to redraw when one is created or reaped, neither of which touches the
-    // active strip.
-    let strip_count_changed =
-        |added: Query<(), Added<LayoutStrip>>, mut removed: RemovedComponents<LayoutStrip>| {
-            !added.is_empty() || removed.read().next().is_some()
-        };
     let native_tabs_enabled =
         |config: Option<Res<Config>>| config.is_none_or(|config| config.native_tabs_enabled());
+
+    app.configure_sets(
+        PreUpdate,
+        (
+            PreUpdateSet::Pump,
+            PreUpdateSet::Demux,
+            PreUpdateSet::Dispatch,
+        )
+            .chain(),
+    );
+    app.configure_sets(
+        Update,
+        (
+            UpdateSet::Input,
+            UpdateSet::Events,
+            UpdateSet::Spawn,
+            UpdateSet::Focus,
+            UpdateSet::Workspace,
+            UpdateSet::Layout,
+            UpdateSet::Housekeeping,
+        )
+            .chain(),
+    );
+    app.configure_sets(
+        PostUpdate,
+        (
+            PostUpdateSet::Animate,
+            PostUpdateSet::Ui,
+            PostUpdateSet::Bookkeeping,
+        )
+            .chain(),
+    );
 
     app.add_systems(
         Startup,
@@ -123,35 +202,23 @@ pub fn register_systems(app: &mut bevy::app::App) {
     app.add_systems(
         PreUpdate,
         (
-            systems::pump_events,
+            systems::pump_events.in_set(PreUpdateSet::Pump),
+            systems::demux_input_events.in_set(PreUpdateSet::Demux),
             // Read creation notifications in the same frame that pumps them.
             // Otherwise an idle pump can wait up to its next timeout before
             // the first resize of a newly visible window.
-            systems::window_creation_event.after(systems::pump_events),
-            systems::demux_input_events.after(systems::pump_events),
+            systems::window_creation_event.in_set(PreUpdateSet::Dispatch),
         ),
     );
     app.add_systems(
         Update,
         (
             (
-                triggers::apply_window_defaults,
-                systems::detect_tabbed_windows.run_if(native_tabs_enabled),
-                triggers::apply_window_positions,
+                systems::window_resized_update_frame,
+                systems::window_moved_update_frame,
             )
                 .chain()
-                .after(systems::finish_setup),
-            (
-                systems::add_existing_process,
-                systems::add_existing_application,
-                systems::finish_setup,
-            )
-                .chain()
-                .run_if(resource_exists::<Initializing>),
-            systems::add_launched_process.run_if(on_timer(APP_OBSERVABILITY_CHECK_FREQ)),
-            systems::add_launched_application.run_if(on_timer(APP_OBSERVABILITY_CHECK_FREQ)),
-            systems::fresh_marker_cleanup,
-            systems::timeout_ticker,
+                .run_if(not_swiping),
             workspace::cleanup_unordered_windows
                 .run_if(not(resource_exists::<Initializing>))
                 .run_if(on_timer(CLOSED_WINDOW_CHECK_FREQ)),
@@ -161,22 +228,50 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 .run_if(on_timer(CLOSED_WINDOW_CHECK_FREQ)),
             systems::auto_discover_unmanaged_focused_windows,
             systems::retry_front_switch,
+        )
+            .in_set(UpdateSet::Events),
+    );
+    app.add_systems(
+        Update,
+        (
+            systems::add_launched_process.run_if(on_timer(APP_OBSERVABILITY_CHECK_FREQ)),
+            systems::add_launched_application.run_if(on_timer(APP_OBSERVABILITY_CHECK_FREQ)),
+            (
+                systems::add_existing_process,
+                systems::add_existing_application,
+            )
+                .chain()
+                .run_if(resource_exists::<Initializing>),
+            (
+                triggers::apply_window_defaults,
+                systems::detect_tabbed_windows.run_if(native_tabs_enabled),
+                triggers::apply_window_positions,
+            )
+                .chain()
+                .after(systems::add_launched_application)
+                .after(systems::add_existing_application),
+            systems::finish_setup
+                .after(triggers::apply_window_positions)
+                .run_if(resource_exists::<Initializing>),
+        )
+            .in_set(UpdateSet::Spawn),
+    );
+    app.add_systems(
+        Update,
+        (
+            systems::fresh_marker_cleanup,
+            systems::timeout_ticker,
             systems::update_low_power_state
                 .run_if(resource_exists::<LowPowerMode>)
                 .run_if(on_timer(LOW_POWER_MODE_CHECK)),
-            (
-                systems::window_resized_update_frame,
-                systems::window_moved_update_frame,
-            )
-                .chain()
-                .run_if(not_swiping),
             systems::cleanup_on_exit,
             restore::tick_restore_grace,
             state::periodic_state_save.run_if(on_timer(Duration::from_mins(5))),
             state::cleanup_on_exit,
             script_state::periodic_script_state_save.run_if(on_timer(Duration::from_mins(5))),
             script_state::script_state_cleanup_on_exit,
-        ),
+        )
+            .in_set(UpdateSet::Housekeeping),
     );
     app.add_systems(
         PostUpdate,
@@ -192,18 +287,27 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 systems::commit_window_size.run_if(not(resource_exists::<Initializing>)),
             )
                 .chain(),
+        )
+            .in_set(PostUpdateSet::Animate),
+    );
+    app.add_systems(
+        PostUpdate,
+        (
             (
                 systems::update_overlays
-                    .after(systems::animate_entities)
-                    .after(systems::animate_resize_entities)
                     .run_if(dimming_enabled)
                     .run_if(vw_indicator_dirty),
                 systems::update_flash_messages,
             )
                 .chain(),
-            crate::menubar::update_menu_bar
-                .run_if(vw_indicator_dirty.or_eager(strip_count_changed)),
-        ),
+            crate::menubar::update_menu_bar.run_if(
+                crate::menubar::menu_bar_dirty
+                    .or_eager(crate::menubar::menu_viewport_dirty)
+                    .or_eager(resource_changed::<Config>)
+                    .or_eager(resource_changed::<crate::menubar::MenuBarVisibility>),
+            ),
+        )
+            .in_set(PostUpdateSet::Ui),
     );
 }
 
@@ -213,9 +317,6 @@ pub fn register_triggers(app: &mut bevy::app::App) {
         Update,
         (
             triggers::front_switched_trigger,
-            triggers::window_focused_trigger
-                .after(triggers::apply_window_positions)
-                .before(focus::fix_window_size_on_focus),
             triggers::mission_control_trigger,
             triggers::application_event_trigger,
             triggers::dispatch_application_messages,
@@ -224,7 +325,14 @@ pub fn register_triggers(app: &mut bevy::app::App) {
             triggers::refresh_configuration_trigger,
             triggers::theme_change_trigger,
             triggers::window_resize_verifier,
-        ),
+        )
+            .in_set(UpdateSet::Events),
+    );
+    app.add_systems(
+        Update,
+        triggers::window_focused_trigger
+            .in_set(UpdateSet::Focus)
+            .before(focus::fix_window_size_on_focus),
     );
     app.add_observer(triggers::window_unmanaged_trigger)
         .add_observer(triggers::window_managed_trigger)
@@ -772,17 +880,16 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
 
     app.set_runner(autorelease_runner);
 
+    crate::menubar::load_menu_bar_preference(&mut app);
     let menu_events = sender.clone();
     let mut platform_callbacks = PlatformCallbacks::new(sender);
-    platform_callbacks.setup_handlers()?;
+    let initial_config = platform_callbacks.setup_handlers()?;
     let mtm = platform_callbacks.main_thread_marker;
     let overlay_manager = OverlayManager::new(mtm);
     let flash_message_manager = FlashMessageManager::new(mtm);
-    let menu_bar_manager = MenuBarManager::new(mtm, menu_events);
     app.insert_non_send(platform_callbacks)
         .insert_non_send(overlay_manager)
         .insert_non_send(flash_message_manager)
-        .insert_non_send(menu_bar_manager)
         .insert_non_send(receiver);
 
     // `CONFIGURATION_FILE` is `None` exactly when an `init.lua` took the TOML
@@ -836,6 +943,8 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         app.insert_resource(lua::LuaScriptPath(path));
         app.add_plugins(lua::LuaPlugin {});
     }
+
+    crate::menubar::setup_menu_bar(&mut app, mtm, menu_events, &initial_config);
 
     Ok(app)
 }

@@ -1,7 +1,7 @@
 use bevy::app::{App, Plugin, PostUpdate, PreUpdate, Update};
 use bevy::ecs::change_detection::{DetectChanges as _, DetectChangesMut, Ref};
 use bevy::ecs::component::Component;
-use bevy::ecs::entity::Entity;
+use bevy::ecs::entity::{Entity, EntityHashMap};
 use bevy::ecs::hierarchy::ChildOf;
 use bevy::ecs::lifecycle::Add;
 use bevy::ecs::message::MessageReader;
@@ -10,6 +10,7 @@ use bevy::ecs::query::{Added, Has, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, Local, ParamSet, Populated, Query, Res, ResMut, Single};
+use bevy::ecs::world::World;
 use bevy::time::common_conditions::on_timer;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -34,6 +35,11 @@ use crate::manager::{Application, Display, Origin, Window, WindowManager};
 use crate::platform::{WinID, WorkspaceId};
 
 pub struct WorkspaceEventsPlugin;
+
+/// Suppresses the popup for a strip activated by startup session restore.
+/// Removed after that activation so later user switches still flash.
+#[derive(Component)]
+pub(crate) struct RestoredActivation;
 
 /// The strip, its origin, whether it's visible, and its saved position, as
 /// [`handle_virtual_window_moves`] needs them to slide a strip to/from its
@@ -78,6 +84,20 @@ type RenumberStrips<'w, 's> = ParamSet<
     ),
 >;
 
+/// Workspace identity, display ownership, and popup-specific activation state.
+type PopupStrips<'w, 's> = Query<
+    'w,
+    's,
+    (
+        Entity,
+        &'static LayoutStrip,
+        &'static ChildOf,
+        Has<ActiveWorkspaceMarker>,
+        Has<SelectedVirtualMarker>,
+        Has<RestoredActivation>,
+    ),
+>;
+
 impl Plugin for WorkspaceEventsPlugin {
     fn build(&self, app: &mut App) {
         const DISPLAY_CHANGE_CHECK_FREQ: Duration = Duration::from_millis(1000);
@@ -85,10 +105,22 @@ impl Plugin for WorkspaceEventsPlugin {
         let reap_workspaces = |config: Option<Res<Config>>| {
             config.is_some_and(|config| config.reap_empty_workspaces())
         };
+        let workspace_or_display_activated =
+            |workspace_activated: Query<(), Added<ActiveWorkspaceMarker>>,
+             display_activated: Query<(), Added<ActiveDisplayMarker>>| {
+                !workspace_activated.is_empty() || !display_activated.is_empty()
+            };
 
         app.add_systems(
             PreUpdate,
-            (switch_virtual_workspace_bind, move_virtual_workspace_bind),
+            (switch_virtual_workspace_bind, move_virtual_workspace_bind)
+                .after(crate::ecs::systems::pump_events),
+        );
+        app.add_systems(
+            PreUpdate,
+            find_orphaned_workspaces
+                .after(crate::ecs::display::reconcile_displays)
+                .run_if(on_timer(DISPLAY_CHANGE_CHECK_FREQ)),
         );
         app.add_systems(
             Update,
@@ -98,14 +130,19 @@ impl Plugin for WorkspaceEventsPlugin {
                 workspace_change_handler,
                 workspace_created_handler,
                 show_active_workspace,
-                handle_virtual_window_moves,
+                handle_virtual_window_moves.before(super::layout::layout_sizes_changed),
                 detect_moved_windows.run_if(not(resource_exists::<Initializing>)),
-                find_orphaned_workspaces
-                    .after(crate::ecs::display::reconcile_displays)
-                    .run_if(on_timer(DISPLAY_CHANGE_CHECK_FREQ)),
             ),
         );
-        app.add_systems(PostUpdate, workspace_destroyed_handler);
+        app.add_systems(
+            PostUpdate,
+            (
+                workspace_destroyed_handler,
+                flash_workspace_on_activation
+                    .run_if(workspace_or_display_activated)
+                    .before(crate::ecs::systems::update_flash_messages),
+            ),
+        );
         app.add_observer(cleanup_active_workspace_marker)
             .add_observer(cleanup_selected_space_marker);
     }
@@ -297,15 +334,21 @@ fn workspace_change_handler(
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn detect_moved_windows(
     activated_workspace: Single<Entity, Added<ActiveWorkspaceMarker>>,
-    mut workspaces: Query<(&mut LayoutStrip, Entity, Has<NativeFullscreenMarker>)>,
+    mut workspaces: Query<(
+        &mut LayoutStrip,
+        Entity,
+        Has<NativeFullscreenMarker>,
+        Option<&ChildOf>,
+    )>,
     apps: Query<&mut Application>,
     window_manager: Res<WindowManager>,
+    reconcile_state: Option<Res<crate::ecs::display::DisplayReconcileState>>,
     mut ignored_windows: Local<HashSet<WinID>>,
     mut ctx: WindowCtx,
 ) {
-    let Ok(workspace_id) = workspaces
+    let Ok((workspace_id, target_display)) = workspaces
         .get(*activated_workspace)
-        .map(|strip| strip.0.id())
+        .map(|(strip, _, _, child)| (strip.id(), child.map(ChildOf::parent)))
     else {
         return;
     };
@@ -365,22 +408,47 @@ fn detect_moved_windows(
         }
     }
 
+    if reconcile_state.is_some_and(|state| state.is_settling()) {
+        return;
+    }
+
+    let moved_set: bevy::ecs::entity::EntityHashSet = moved_windows
+        .iter()
+        .copied()
+        .filter(|&entity| {
+            !workspaces
+                .iter()
+                .any(|(strip, _, fullscreen, _)| fullscreen && strip.contains(entity))
+        })
+        .collect();
+    if moved_set.is_empty() {
+        return;
+    }
+
+    if is_batch_workspace_move(workspace_id, &moved_set, &workspaces)
+        && let Some(display_entity) = target_display
+    {
+        ctx.commands.queue(move |world: &mut World| {
+            crate::ecs::display::migrate_moved_windows_for_space(
+                world,
+                display_entity,
+                workspace_id,
+            );
+        });
+        return;
+    }
+
     for entity in moved_windows {
-        if workspaces
-            .iter()
-            .any(|(strip, _, fullscreen)| fullscreen && strip.contains(entity))
-        {
-            // Do not relocate fullscreen windows, this will happen
-            // during the destructino of their workspace.
+        if !moved_set.contains(&entity) {
             continue;
         }
 
         debug!("Window {entity} moved to workspace {workspace_id}.");
         let moving_entities = workspaces
             .iter()
-            .find_map(|(strip, _, _)| strip.tab_group(entity))
+            .find_map(|(strip, _, _, _)| strip.tab_group(entity))
             .unwrap_or_else(|| vec![entity]);
-        for (mut strip, strip_entity, _) in &mut workspaces {
+        for (mut strip, strip_entity, _, _) in &mut workspaces {
             if strip_entity == *activated_workspace {
                 strip.append_tab_group(&moving_entities);
             } else {
@@ -390,6 +458,38 @@ fn detect_moved_windows(
             }
         }
     }
+}
+
+fn is_batch_workspace_move(
+    workspace_id: WorkspaceId,
+    moved_set: &bevy::ecs::entity::EntityHashSet,
+    workspaces: &Query<(
+        &mut LayoutStrip,
+        Entity,
+        Has<NativeFullscreenMarker>,
+        Option<&ChildOf>,
+    )>,
+) -> bool {
+    workspaces.iter().any(|(strip, _, fullscreen, child)| {
+        if fullscreen || strip.id() == workspace_id {
+            return false;
+        }
+        let matching: Vec<Entity> = strip
+            .all_windows()
+            .into_iter()
+            .filter(|entity| moved_set.contains(entity))
+            .collect();
+        if matching.is_empty() {
+            return false;
+        }
+        if child.is_none() {
+            return true;
+        }
+        let first_group = strip
+            .tab_group(matching[0])
+            .unwrap_or_else(|| vec![matching[0]]);
+        matching.iter().any(|entity| !first_group.contains(entity))
+    })
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
@@ -507,6 +607,7 @@ fn find_orphaned_workspaces(
     mut commands: Commands,
 ) {
     let present = window_manager.present_displays();
+    let mut rehomed = false;
 
     for (orphan, orphan_entity, timeout, child) in orphans {
         // Row 0 is the row every space is created with, so it is re-parented
@@ -564,7 +665,14 @@ fn find_orphaned_workspaces(
 
         if let Ok(mut cmd) = commands.get_entity(orphan_entity) {
             cmd.try_remove::<Timeout>().insert(ChildOf(target_entity));
+            commands.queue(move |world: &mut World| {
+                crate::ecs::display::refresh_reparented_strip(world, orphan_entity);
+            });
+            rehomed = true;
         }
+    }
+    if rehomed {
+        commands.trigger(SendMessageTrigger(Event::DisplayChanged));
     }
 }
 
@@ -587,7 +695,7 @@ pub(crate) fn cleanup_unordered_windows(
 
     for window in windows {
         let window_id = window.id();
-        if window_manager.window_is_unordered(window_id) && window.role().is_err() {
+        if window_manager.window_is_unordered(window_id) && !window.is_alive() {
             debug!("Window {window_id} is unordered; removing it.");
             commands.trigger(SendMessageTrigger(Event::WindowDestroyed {
                 window_id,
@@ -616,6 +724,62 @@ fn cleanup_active_workspace_marker(
             entity_commands.try_remove::<ActiveWorkspaceMarker>();
         }
     });
+}
+
+fn flash_workspace_on_activation(
+    active_display: Single<Entity, With<ActiveDisplayMarker>>,
+    displays: Query<(Entity, &Display)>,
+    strips: PopupStrips,
+    window_manager: Res<WindowManager>,
+    config: Res<Config>,
+    mut previous_by_display: Local<EntityHashMap<Entity>>,
+    mut commands: Commands,
+) {
+    previous_by_display.retain(|display, _| displays.contains(*display));
+    for (display_entity, display) in &displays {
+        if previous_by_display.contains_key(&display_entity) {
+            continue;
+        }
+        let Ok(space_id) = window_manager.active_display_space(display.id()) else {
+            continue;
+        };
+        let selected = strips
+            .iter()
+            .filter(|(_, strip, parent, _, _, _)| {
+                parent.parent() == display_entity && strip.id() == space_id
+            })
+            .min_by_key(|(_, strip, _, _, selected, _)| (!*selected, strip.virtual_index));
+        if let Some((strip_entity, _, _, _, _, _)) = selected {
+            previous_by_display.insert(display_entity, strip_entity);
+        }
+    }
+
+    let Some((entity, strip, display, _, _, restored)) =
+        strips.iter().find(|(_, _, _, active, _, _)| *active)
+    else {
+        return;
+    };
+    if display.parent() != *active_display {
+        // Focus can activate the destination strip before the OS notifies us
+        // which display is active. Re-run when ActiveDisplayMarker moves so the
+        // message is never rendered at the old display's coordinates.
+        return;
+    }
+
+    // Compare only with the strip last active on this display. A focus move
+    // between displays is not a workspace switch on either display.
+    let switched = previous_by_display
+        .insert(display.parent(), entity)
+        .is_some_and(|old| old != entity);
+    if restored {
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<RestoredActivation>();
+        }
+        return;
+    }
+    if switched && config.workspace_popup_status() {
+        commands.flash_message(format!("{}", strip.virtual_index + 1), 1.0);
+    }
 }
 
 /// Removes previuos `SelectedVirtualMarker`'s when a new one is inserted.
@@ -946,9 +1110,6 @@ fn switch_virtual_workspace_bind(
                     active_display.entity(),
                     true,
                 );
-                if config.workspace_popup_status() {
-                    commands.flash_message(format!("{}", target_index + 1), 1.0);
-                }
                 return;
             } else {
                 current_index
@@ -969,9 +1130,6 @@ fn switch_virtual_workspace_bind(
                     true,
                 );
 
-                if config.workspace_popup_status() {
-                    commands.flash_message(format!("{}", *target_virtual_index + 1), 1.0);
-                }
                 return;
             };
             index
@@ -991,9 +1149,6 @@ fn switch_virtual_workspace_bind(
                 true,
             );
 
-            if config.workspace_popup_status() {
-                commands.flash_message(format!("{}", next_virtual_index + 1), 1.0);
-            }
             return;
         }
         _ => return,
@@ -1004,13 +1159,8 @@ fn switch_virtual_workspace_bind(
     }
 
     let new_entity = rows[next_index].0;
-    let next_virtual_index = rows[next_index].1.virtual_index;
     if let Ok(mut entity_commands) = commands.get_entity(new_entity) {
         entity_commands.try_insert(ActiveWorkspaceMarker);
-
-        if config.workspace_popup_status() {
-            commands.flash_message(format!("{}", next_virtual_index + 1), 1.0);
-        }
     }
     debug!(
         "Switched virtual workspace on display {} from {} to {}",
@@ -1099,10 +1249,6 @@ fn move_virtual_workspace_bind(
             target_virtual_index,
             move_focus,
         });
-    }
-
-    if move_focus == MoveFocus::Follow && config.workspace_popup_status() {
-        commands.flash_message(format!("{}", target_virtual_index + 1), 1.0);
     }
 
     debug!("Moving {focused_entity} to new virtual space {target_virtual_index}");
@@ -1285,10 +1431,9 @@ pub(crate) fn show_active_workspace(
 /// (despawning a strip can leave a gap but never collides). Runs
 /// independently of `reap_empty_workspaces` because without it, duplicate
 /// indices silently break navigation: `switch_virtual_workspace_bind`
-/// sorts rows by `virtual_index` and flashes `next_virtual_index + 1` as
-/// the OSD label, so two rows both at 0 mean South moves between them
-/// while the OSD stays at "1" and North no-ops at the bottom of the
-/// saturating sub.
+/// sorts rows by `virtual_index`, so two rows both at 0 mean South moves
+/// between them while the OSD stays at "1" and North no-ops at the bottom
+/// of the saturating sub.
 ///
 /// Sources of duplicate creation we have to defend against:
 /// - `LayoutStrip::fullscreen` pins `virtual_index` to 0 unconditionally.

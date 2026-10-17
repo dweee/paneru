@@ -22,6 +22,8 @@ mod runtime;
 mod worker;
 mod world;
 
+pub(crate) use paneru::lua::shared;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -68,8 +70,10 @@ impl Plugin for LuaPlugin {
                 // Cocoa.
                 serve_lua_queries.before(crate::ecs::systems::pump_events),
                 serve_lua_store.before(crate::ecs::systems::pump_events),
-                drain_lua_outbox,
-                command_lua_handler,
+                drain_lua_outbox.after(crate::ecs::systems::pump_events),
+                command_lua_handler
+                    .after(crate::ecs::systems::pump_events)
+                    .after(drain_lua_outbox),
             ),
         );
         // ...and again after everything, for reads made during this frame's
@@ -87,13 +91,17 @@ pub fn dispatch_lua_events(worker: Option<Res<LuaWorker>>, mut reader: MessageRe
     };
     // No `paneru.on` handlers means nothing consumes these events; just
     // advance past them.
-    if !worker.has_event_handlers() {
+    let mask = worker.subscribed_event_mask();
+    if mask == 0 {
         for _ in reader.read() {}
         return;
     }
     let events: Vec<convert::LuaEvent> = reader
         .read()
-        .filter_map(|event| convert::LuaEvent::try_from(event).ok())
+        .filter_map(|event| {
+            let lua_event = convert::LuaEvent::try_from(event).ok()?;
+            (mask & convert::LuaEvent::bit_for_name(lua_event.name()) != 0).then_some(lua_event)
+        })
         .collect();
     if events.is_empty() {
         return;

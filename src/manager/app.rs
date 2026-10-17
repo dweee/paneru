@@ -88,6 +88,12 @@ pub trait ApplicationApi: Send + Sync {
     ///
     /// Returns an `Error` if the window list cannot be retrieved.
     fn window_list(&self, config: &Config) -> Vec<Window>;
+    /// Returns the IDs of the windows the app currently exposes over
+    /// accessibility.
+    ///
+    /// A background native tab is missing from this list while the window
+    /// server still reports it on screen, which is what tells the two apart.
+    fn ax_window_ids(&self) -> Vec<WinID>;
     /// Starts observing application-level accessibility notifications.
     ///
     /// # Errors
@@ -199,7 +205,7 @@ impl ApplicationOS {
             // through it, windows included; a call that trips it fails with
             // `kAXErrorCannotComplete`, treated like any other AX error.
             AXUIElementSetMessagingTimeout(ptr, AX_MESSAGING_TIMEOUT_SEC);
-            AXUIWrapper::retain(ptr)?
+            AXUIWrapper::from_retained(ptr)?
         };
         let bundle_id = process
             .application()
@@ -283,6 +289,18 @@ impl ApplicationApi for ApplicationOS {
                         WindowOS::new_with_config(&element, config, bundle_id)
                             .map(|window| Window::new(Box::new(window)))
                     })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn ax_window_ids(&self) -> Vec<WinID> {
+        self.element
+            .windows()
+            .map(|windows| {
+                windows
+                    .iter()
+                    .filter_map(|element| ax_window_id(element.as_ptr()).ok())
                     .collect()
             })
             .unwrap_or_default()

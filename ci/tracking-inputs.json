@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "inputs": {
+    "crane": {
+      "source": "github:ipetkov/crane"
+    },
+    "flake-parts": {
+      "source": "github:hercules-ci/flake-parts"
+    },
+    "import-tree": {
+      "source": "github:vic/import-tree"
+    },
+    "nix-darwin": {
+      "source": "github:nix-darwin/nix-darwin/master"
+    },
+    "nixpkgs": {
+      "source": "github:nixos/nixpkgs/nixos-unstable"
+    }
+  }
+}

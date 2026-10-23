@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "checks": [],
+  "upstreams": [
+    {
+      "name": "karinushka/paneru",
+      "api": "https://api.github.com/repos/karinushka/paneru/releases/latest"
+    }
+  ]
+}

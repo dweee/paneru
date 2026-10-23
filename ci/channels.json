@@ -1,0 +1,22 @@
+{
+  "targets": {
+    "aarch64-darwin": [
+      {
+        "attribute": "packages.aarch64-darwin.paneru",
+        "visibility": "public"
+      },
+      {
+        "attribute": "packages.aarch64-darwin.paneru-lua",
+        "visibility": "public"
+      }
+    ]
+  },
+  "excludedSystems": [],
+  "submodules": false,
+  "integrationInventory": false,
+  "version": 1,
+  "forge": "github",
+  "repository": "dweee/paneru",
+  "branch": "flakey",
+  "remote": "https://github.com/dweee/paneru.git"
+}

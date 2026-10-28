@@ -18,5 +18,9 @@
   "forge": "github",
   "repository": "dweee/paneru",
   "branch": "flakey",
-  "remote": "https://github.com/dweee/paneru.git"
+  "remote": "https://github.com/dweee/paneru.git",
+  "inputCheckWorkflows": [
+    "release-channels.yml",
+    "darwin-actions.yml"
+  ]
 }

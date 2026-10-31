@@ -52,6 +52,7 @@ struct Touch {
     identity: Retained<AnyObject>,
     x: f64,
     y: f64,
+    device_width_points: f64,
     /// Whether the finger landed this event, which suppresses delta tracking
     /// until every finger is down.
     began: bool,
@@ -68,6 +69,7 @@ impl Touch {
                     identity: touch.identity(),
                     x: position.x,
                     y: position.y,
+                    device_width_points: touch.deviceSize().width,
                     began: touch.phase() == NSTouchPhase::Began,
                 }
             })
@@ -81,11 +83,15 @@ struct SwipeSample<I> {
     identity: I,
     x: f64,
     y: f64,
+    device_width_points: f64,
 }
 
 #[derive(Debug, PartialEq)]
 enum SwipeMovement {
-    Horizontal(f64),
+    Horizontal {
+        delta: f64,
+        distance_cm: Option<f64>,
+    },
     Vertical(f64),
 }
 
@@ -122,7 +128,13 @@ impl<I> SwipeAccumulator<I> {
                 self.anchors
                     .iter()
                     .find(|previous| same_identity(&previous.identity, &current.identity))
-                    .map(|previous| (previous.x - current.x, previous.y - current.y))
+                    .map(|previous| {
+                        (
+                            previous.x - current.x,
+                            previous.y - current.y,
+                            current.device_width_points,
+                        )
+                    })
             })
             .collect::<Option<Vec<_>>>();
         let Some(deltas) = deltas else {
@@ -130,19 +142,24 @@ impl<I> SwipeAccumulator<I> {
             return None;
         };
 
-        let x_sum: f64 = deltas.iter().map(|(x, _)| x).sum();
-        let y_sum: f64 = deltas.iter().map(|(_, y)| y).sum();
+        let x_sum: f64 = deltas.iter().map(|(x, _, _)| x).sum();
+        let y_sum: f64 = deltas.iter().map(|(_, y, _)| y).sum();
         // Once a gesture has begun, the movement of _any_ finger is enough to warrant a swipe.
         let horizontally_moved_fingers = deltas
             .iter()
-            .filter(|(x, _)| x.abs() > SWIPE_THRESHOLD)
+            .filter(|(x, _, _)| x.abs() > SWIPE_THRESHOLD)
             .count();
         let vertically_moved_fingers = deltas
             .iter()
-            .filter(|(_, y)| y.abs() > SWIPE_THRESHOLD)
+            .filter(|(_, y, _)| y.abs() > SWIPE_THRESHOLD)
             .count();
         let movement = if x_sum.abs() >= y_sum.abs() {
-            (horizontally_moved_fingers > 0).then_some(SwipeMovement::Horizontal(x_sum))
+            (horizontally_moved_fingers > 0).then(|| SwipeMovement::Horizontal {
+                delta: x_sum,
+                distance_cm: physical_swipe_distance_cm(
+                    deltas.iter().map(|(x, _, width)| (*x, *width)),
+                ),
+            })
         } else {
             (vertically_moved_fingers > 0).then_some(SwipeMovement::Vertical(y_sum))
         };
@@ -199,6 +216,7 @@ pub(super) struct InputHandler {
     /// are suppressed for a short window after this to prevent the OS from
     /// scrolling windows underneath (including momentum scroll after finger lift).
     last_swipe_time: Option<Instant>,
+    invalid_device_size_warned: bool,
     // Prevents from being Unpin automatically
     _pin: PhantomPinned,
 }
@@ -225,6 +243,7 @@ impl InputHandler {
             tap_port: None,
             run_loop_source: None,
             last_swipe_time: None,
+            invalid_device_size_warned: false,
             _pin: PhantomPinned,
         }
     }
@@ -550,6 +569,7 @@ impl InputHandler {
             let phase = ns_event.phase();
             if phase.0 & NS_EVENT_PHASE_CANCELLED != 0 || phase.0 & NS_EVENT_PHASE_ENDED != 0 {
                 self.swipe_accumulator.reset();
+                self.invalid_device_size_warned = false;
                 if let Some(events) = &self.events {
                     _ = events.send(Event::TouchpadUp);
                 }
@@ -567,6 +587,7 @@ impl InputHandler {
                 return false;
             }
             if fingers.iter().any(|finger| finger.began) {
+                self.invalid_device_size_warned = false;
                 // A fresh gesture: nothing carries over from the last one.
                 self.swipe_accumulator.reset();
                 if let Some(events) = &self.events {
@@ -580,6 +601,7 @@ impl InputHandler {
                     identity: finger.identity,
                     x: finger.x,
                     y: finger.y,
+                    device_width_points: finger.device_width_points,
                 })
                 .collect();
             let movement = self.swipe_accumulator.sample(samples, |previous, current| {
@@ -587,11 +609,16 @@ impl InputHandler {
                 unsafe { msg_send![&**previous, isEqual: &**current] }
             });
             match movement {
-                Some(SwipeMovement::Horizontal(delta)) => {
+                Some(SwipeMovement::Horizontal { delta, distance_cm }) => {
+                    if distance_cm.is_none() && !self.invalid_device_size_warned {
+                        warn!("trackpad did not provide a valid device size for paging");
+                        self.invalid_device_size_warned = true;
+                    }
                     if let Some(events) = &self.events {
                         let _ = events.send(Event::Swipe {
                             delta,
                             fingers: configured_fingers,
+                            distance_cm: distance_cm.unwrap_or(0.0),
                         });
                         self.last_swipe_time = Some(Instant::now());
                     }
@@ -707,6 +734,21 @@ fn get_modifiers(eventflags: CGEventFlags) -> Modifiers {
         })
 }
 
+
+fn physical_swipe_distance_cm(deltas: impl IntoIterator<Item = (f64, f64)>) -> Option<f64> {
+    let (total, count) = deltas.into_iter().try_fold(
+        (0.0, 0_u32),
+        |(total, count), (normalized_delta, width_points)| {
+            (normalized_delta.is_finite() && width_points.is_finite() && width_points > 0.0)
+                .then_some((
+                    total + normalized_delta * width_points * 2.54 / 72.0,
+                    count + 1,
+                ))
+        },
+    )?;
+    (count > 0).then_some(total / f64::from(count))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -717,15 +759,30 @@ mod tests {
                 identity,
                 x,
                 y: 0.0,
+                device_width_points: 144.0,
             })
             .collect()
     }
 
     fn assert_horizontal(movement: Option<SwipeMovement>, expected: f64) {
-        let Some(SwipeMovement::Horizontal(delta)) = movement else {
+        let Some(SwipeMovement::Horizontal { delta, .. }) = movement else {
             panic!("expected horizontal swipe, got {movement:?}");
         };
         assert!((delta - expected).abs() < 1e-12, "{delta} != {expected}");
+    }
+
+    #[test]
+    fn accumulated_horizontal_swipe_reports_the_full_physical_distance() {
+        let mut swipe = SwipeAccumulator::default();
+        assert_eq!(swipe.sample(three_fingers(0.0), |a, b| a == b), None);
+        assert_eq!(swipe.sample(three_fingers(0.0004), |a, b| a == b), None);
+
+        let movement = swipe.sample(three_fingers(0.0006), |a, b| a == b);
+        let Some(SwipeMovement::Horizontal { delta, distance_cm }) = movement else {
+            panic!("expected horizontal swipe, got {movement:?}");
+        };
+        assert!((delta + 0.0018).abs() < 1e-12);
+        assert_eq!(distance_cm, Some(-0.003_048));
     }
 
     #[test]
@@ -814,6 +871,7 @@ mod tests {
                     identity,
                     x: 0.0,
                     y,
+                    device_width_points: 144.0,
                 })
                 .collect()
         };

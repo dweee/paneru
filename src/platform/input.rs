@@ -734,7 +734,6 @@ fn get_modifiers(eventflags: CGEventFlags) -> Modifiers {
         })
 }
 
-
 fn physical_swipe_distance_cm(deltas: impl IntoIterator<Item = (f64, f64)>) -> Option<f64> {
     let (total, count) = deltas.into_iter().try_fold(
         (0.0, 0_u32),

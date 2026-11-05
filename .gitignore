@@ -21,3 +21,5 @@ flamegraph.svg
 /chat-history/
 /chat-histories/
 /*.jsonl
+__pycache__/
+*.pyc

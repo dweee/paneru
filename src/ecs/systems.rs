@@ -42,6 +42,45 @@ use crate::overlay::{FlashMessageManager, OverlayManager};
 use crate::platform::input::TapHealth;
 use crate::platform::{PlatformCallbacks, WinID};
 
+// Keep partially registered observers alive during slow AX startup.
+// A separate, low-frequency retry must not gate discovery of usable windows.
+#[derive(bevy::ecs::component::Component)]
+pub(super) struct PendingApplicationObservation;
+
+// Bounded post-launch recovery budget (in 1s ticks) for newly launched
+// processes and applications whose initial `FreshMarker` grace period expired
+// before readiness, observer registration, or their first window settled.
+#[derive(bevy::ecs::component::Component)]
+pub(crate) struct PendingWindowRecovery(u32);
+
+const WINDOW_RECOVERY_ATTEMPTS: u32 = 60;
+
+impl Default for PendingWindowRecovery {
+    fn default() -> Self {
+        Self(WINDOW_RECOVERY_ATTEMPTS)
+    }
+}
+
+type RecoverableApplications<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        Entity,
+        Option<&'static Application>,
+        Option<&'static ChildOf>,
+        Option<&'static mut PendingWindowRecovery>,
+        Has<PendingApplicationObservation>,
+    ),
+    (
+        Without<Children>,
+        Without<FreshMarker>,
+        Or<(
+            With<PendingWindowRecovery>,
+            With<PendingApplicationObservation>,
+        )>,
+    ),
+>;
+
 /// Processes and applications still inside their spawn grace period, with the
 /// `FreshMarker` that says whether the spawn actually completed in time.
 type TimedOutSpawns<'w, 's> = Populated<
@@ -246,7 +285,11 @@ pub(crate) fn add_existing_application(
     for (mut app, entity) in fresh_apps {
         let mut offscreen_windows = vec![];
 
-        if app.observe().is_ok_and(|result| result)
+        let observed = app.observe().is_ok_and(|result| result);
+        if !observed && let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_insert(PendingApplicationObservation);
+        }
+        if observed
             && let Ok((found_windows, offscreen)) = window_manager
                 .find_existing_application_windows(&mut app, &spaces, &config)
                 .inspect_err(|err| warn!("{err}"))
@@ -425,7 +468,7 @@ pub(super) fn add_launched_process(
         if children {
             // Process already has an attached Application, so finish.
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<FreshMarker>();
+                entity_commands.try_remove::<(FreshMarker, PendingWindowRecovery)>();
             }
             continue;
         }
@@ -435,18 +478,42 @@ pub(super) fn add_launched_process(
             return;
         };
 
-        if app.observe().is_ok_and(|good| good) {
-            let timeout = Timeout::new(
-                APP_OBSERVABLE_TIMEOUT,
-                Some(format!(
-                    "{app} did not become observable in {}s.",
-                    APP_OBSERVABLE_TIMEOUT.as_secs()
-                )),
-                &mut commands,
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<(FreshMarker, PendingWindowRecovery)>();
+        }
+
+        // Process readiness precedes usable AX during Emacs startup.
+        // Keep this Application even when subscriptions fail; poll windows separately.
+        let observed = app.observe().is_ok_and(|good| good);
+        let timeout = Timeout::new(
+            APP_OBSERVABLE_TIMEOUT,
+            Some(format!(
+                "{app} did not become observable in {}s.",
+                APP_OBSERVABLE_TIMEOUT.as_secs()
+            )),
+            &mut commands,
+        );
+        // Timing out AX discovery must not destroy the app's
+        // observer. Slow Emacs startup can outlast this grace period.
+        let timeout = Timeout {
+            on_expire: Some(|entity| {
+                entity.try_remove::<(FreshMarker, Timeout)>();
+            }),
+            ..timeout
+        };
+        let mut entity_commands = commands.spawn((
+            app,
+            FreshMarker,
+            PendingWindowRecovery::default(),
+            timeout,
+            ChildOf(entity),
+        ));
+        if !observed {
+            entity_commands.insert(PendingApplicationObservation);
+            debug!(
+                "retaining application with pending observers {}",
+                process.name()
             );
-            commands.spawn((app, FreshMarker, timeout, ChildOf(entity)));
-        } else {
-            debug!("failed to register some observers {}", process.name());
         }
     }
 }
@@ -490,6 +557,62 @@ pub(super) fn add_launched_application(
             debug!("removing FreshMarker from {entity}: windows already created via AXCreated");
             if let Ok(mut entity_commands) = commands.get_entity(entity) {
                 entity_commands.try_remove::<FreshMarker>();
+            }
+        }
+    }
+}
+
+/// Retry on the retained Application, preserving already registered callbacks.
+pub(super) fn retry_application_observers(
+    mut apps: Populated<(Entity, &mut Application), With<PendingApplicationObservation>>,
+    mut commands: Commands,
+) {
+    for (entity, mut app) in &mut apps {
+        if app.observe().is_ok_and(|ready| ready) {
+            if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<PendingApplicationObservation>();
+            }
+            debug!("application observers ready for pid {}", app.pid());
+        }
+    }
+}
+
+// Creation notifications can arrive while AX is unresponsive,
+// or before update_frame can read a usable rect. Retaining an observer alone
+// cannot replay that event. Retry newly launched applications with no managed
+// children at one-second intervals for a bounded recovery window, and despawn
+// headless or permanently unobservable processes once that window expires.
+pub(super) fn recover_windowless_applications(
+    mut apps: RecoverableApplications,
+    config: Res<Config>,
+    mut commands: Commands,
+) {
+    for (entity, app, child_of, recovery, pending_observation) in &mut apps {
+        if let Some(app) = app {
+            let windows = app.window_list(&config);
+            if !windows.is_empty() {
+                commands.trigger(SpawnWindowTrigger(windows));
+                continue;
+            }
+        }
+        if let Some(mut recovery) = recovery {
+            recovery.0 = recovery.0.saturating_sub(1);
+            if recovery.0 > 0 {
+                continue;
+            }
+            let despawn_target = if app.is_none() {
+                Some(entity)
+            } else if pending_observation {
+                Some(child_of.map_or(entity, ChildOf::parent))
+            } else {
+                None
+            };
+            if let Some(target) = despawn_target {
+                if let Ok(mut entity_commands) = commands.get_entity(target) {
+                    entity_commands.try_despawn();
+                }
+            } else if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                entity_commands.try_remove::<PendingWindowRecovery>();
             }
         }
     }
@@ -1168,16 +1291,38 @@ pub(super) fn verify_window_position(
     }
 }
 
+/// Resizes windows whose `Bounds` changed, keeping each one's width as a
+/// share of the display its strip is on: a strip on the display without
+/// focus is sized for its own, and a share of the other would grow or shrink
+/// the window wherever it went next. A window in no strip is of the active
+/// display.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn commit_window_size(
     active_display: ActiveDisplay,
-    mut resized_windows: Populated<(&mut Window, &Bounds, &mut WidthRatio), Changed<Bounds>>,
+    strips: Query<(&LayoutStrip, &ChildOf)>,
+    displays: Query<&Display>,
+    mut resized_windows: Populated<
+        (Entity, &mut Window, &Bounds, &mut WidthRatio),
+        Changed<Bounds>,
+    >,
 ) {
-    let display_bounds = active_display.bounds();
+    let fallback = active_display.bounds().width();
+    let widths: EntityHashMap<i32> = resized_windows
+        .iter()
+        .map(|(entity, ..)| {
+            let width = strips
+                .iter()
+                .find(|(strip, _)| strip.contains(entity))
+                .and_then(|(_, parent)| displays.get(parent.parent()).ok())
+                .map_or(fallback, |display| display.bounds().width());
+            (entity, width)
+        })
+        .collect();
     resized_windows
         .par_iter_mut()
-        .for_each(|(mut window, size, mut width_ratio)| {
-            width_ratio.0 = f64::from(size.0.x) / f64::from(display_bounds.width());
+        .for_each(|(entity, mut window, size, mut width_ratio)| {
+            let width = widths.get(&entity).copied().unwrap_or(fallback);
+            width_ratio.0 = f64::from(size.0.x) / f64::from(width);
             objc2::rc::autoreleasepool(|_| window.resize(size.0));
         });
 }
@@ -1601,11 +1746,16 @@ pub(crate) fn detect_tabbed_windows(
 
 /// Listens for focus events for unknown window IDs and attempts to auto-discover
 /// and manage them on the fly (e.g., when a user clicks an unmanaged tab or window).
+///
+/// Asks only the application that owns the window. This runs on the main
+/// thread, which also carries the input tap: asking every application in turn
+/// held each keystroke for as long as the unresponsive ones took to time out.
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn auto_discover_unmanaged_focused_windows(
     mut messages: MessageReader<Event>,
     windows: Query<&Window>,
     apps: Query<&Application>,
+    window_manager: Res<WindowManager>,
     config: Res<Config>,
     mut cache: Local<HashSet<WinID>>,
     mut commands: Commands,
@@ -1626,26 +1776,32 @@ pub(crate) fn auto_discover_unmanaged_focused_windows(
 
         trace!("Focus event for unknown window id {window_id}; attempting on-the-fly discovery.");
 
-        let mut discovered = None;
-        let (frontmost, non_frontmost): (Vec<_>, Vec<_>) =
-            apps.iter().partition(|app| app.is_frontmost());
+        // Not cached: an owner that isn't known yet may be by the next focus.
+        let Some(owner) = window_manager.window_owner(window_id) else {
+            trace!("No owner for focused window {window_id}; skipping discovery.");
+            continue;
+        };
+        let Some(app) = apps.iter().find(|app| app.pid() == owner) else {
+            trace!(
+                "Focused window {window_id} belongs to unknown pid {owner}; skipping discovery."
+            );
+            continue;
+        };
 
-        for app in frontmost.into_iter().chain(non_frontmost) {
-            if let Some(window) = app.focused_window(&config)
-                && window.id() == window_id
-            {
+        let discovered = app
+            .focused_window(&config)
+            .filter(|window| window.id() == window_id)
+            .inspect(|_| {
                 debug!("Discovered unknown focused window {window_id} via focused_window.");
-                discovered = Some(window);
-                break;
-            }
-
-            let window_list = app.window_list(&config);
-            if let Some(window) = window_list.into_iter().find(|w| w.id() == window_id) {
+            })
+            .or_else(|| {
+                let window = app
+                    .window_list(&config)
+                    .into_iter()
+                    .find(|w| w.id() == window_id)?;
                 debug!("Discovered unknown focused window {window_id} via window_list scan.");
-                discovered = Some(window);
-                break;
-            }
-        }
+                Some(window)
+            });
 
         if let Some(window) = discovered {
             commands.trigger(SpawnWindowTrigger(vec![window]));

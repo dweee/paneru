@@ -536,6 +536,7 @@ fn current_window(
         identifier: "main".to_string(),
         role: "AXWindow".to_string(),
         subrole: "AXStandardWindow".to_string(),
+        workspace_id: None,
     }
 }
 
@@ -646,6 +647,37 @@ fn test_query_state_includes_floating_windows() {
     assert_eq!(state.virtual_workspaces[0].windows.len(), 1);
     assert!(state.virtual_workspaces[0].windows[0].focused);
     assert!(state.virtual_workspaces[0].windows[0].floating);
+    assert_eq!(state.virtual_workspaces[0].windows[0].column, None);
+    assert_eq!(state.virtual_workspaces[0].windows[0].row, None);
+}
+
+#[test]
+fn test_query_state_reports_each_tiled_window_column_and_row() {
+    use crate::tests::harness::TestHarness;
+
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.app.update();
+
+    let world = harness.world();
+    let mut strips = world.query_filtered::<&mut LayoutStrip, With<ActiveWorkspaceMarker>>();
+    let mut strip = strips.single_mut(world).expect("active workspace");
+    let last = strip.all_windows()[2];
+    strip
+        .stack(last)
+        .expect("the last column stacks onto its neighbour");
+
+    let state = extract_query_state(world).expect("query state extraction");
+    let positions = state.virtual_workspaces[0]
+        .windows
+        .iter()
+        .map(|window| (window.column, window.row))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        positions,
+        vec![(Some(0), Some(0)), (Some(1), Some(0)), (Some(1), Some(1))],
+        "a stacked window shares its column and sits in the row below"
+    );
 }
 
 #[test]
@@ -980,6 +1012,104 @@ fn test_layout_ops_apply_to_the_named_window_not_the_focused_one() {
 
 #[cfg(feature = "lua")]
 #[test]
+fn test_layout_op_stack_lands_in_the_named_column() {
+    use crate::commands::Command;
+    use crate::tests::harness::TestHarness;
+    use crate::types::windowset::LayoutOp;
+
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.app.update();
+
+    let columns = |harness: &mut TestHarness| -> Vec<Vec<i32>> {
+        extract_window_set(harness.world())
+            .expect("window set extraction")
+            .current()
+            .expect("an active workspace")
+            .columns
+            .iter()
+            .map(|column| column.windows.iter().map(|window| window.id).collect())
+            .collect()
+    };
+    let before = columns(&mut harness);
+    assert_eq!(before.len(), 3);
+    let (first, middle, last) = (before[0][0], before[1][0], before[2][0]);
+
+    // Onto the first column, not the middle one that sits to its left: the
+    // window set promised the script `onto`'s column, and so should the layout.
+    harness.app.world_mut().write_message(Event::Command {
+        command: Command::Layout(vec![LayoutOp::Stack {
+            window: last,
+            onto: first,
+            tabs: false,
+        }]),
+    });
+    harness.app.update();
+    harness.app.update();
+
+    assert_eq!(columns(&mut harness), vec![vec![first, last], vec![middle]]);
+}
+
+#[cfg(feature = "lua")]
+#[test]
+fn test_layout_op_stack_onto_fullscreen_column_leaves_window_in_place() {
+    use crate::commands::Command;
+    use crate::ecs::ActiveWorkspaceMarker;
+    use crate::tests::harness::{TestHarness, find_window_entity};
+    use crate::types::windowset::LayoutOp;
+
+    let mut harness = TestHarness::new().with_windows(3);
+    harness.app.update();
+
+    let columns = |harness: &mut TestHarness| -> Vec<Vec<i32>> {
+        extract_window_set(harness.world())
+            .expect("window set extraction")
+            .current()
+            .expect("an active workspace")
+            .columns
+            .iter()
+            .map(|column| column.windows.iter().map(|window| window.id).collect())
+            .collect()
+    };
+    let before = columns(&mut harness);
+    assert_eq!(before.len(), 3);
+    let (first, middle, last) = (before[0][0], before[1][0], before[2][0]);
+
+    let first_entity = find_window_entity(first, harness.world());
+    let middle_entity = find_window_entity(middle, harness.world());
+    let last_entity = find_window_entity(last, harness.world());
+    {
+        let world = harness.world();
+        let strip_entity = world
+            .query_filtered::<Entity, (With<LayoutStrip>, With<ActiveWorkspaceMarker>)>()
+            .single(world)
+            .expect("active strip");
+        let mut strip = world
+            .get_mut::<LayoutStrip>(strip_entity)
+            .expect("layout strip");
+        *strip = LayoutStrip::fullscreen(TEST_WORKSPACE_ID, first_entity);
+        strip.append(middle_entity);
+        strip.append(last_entity);
+    }
+
+    harness.app.world_mut().write_message(Event::Command {
+        command: Command::Layout(vec![LayoutOp::Stack {
+            window: last,
+            onto: first,
+            tabs: false,
+        }]),
+    });
+    harness.app.update();
+    harness.app.update();
+
+    assert_eq!(
+        columns(&mut harness),
+        vec![vec![first], vec![middle], vec![last]],
+        "refused fullscreen stack must not move `last` next to `first`"
+    );
+}
+
+#[cfg(feature = "lua")]
+#[test]
 fn test_layout_ops_skip_a_vanished_window_and_apply_its_neighbours() {
     use crate::commands::Command;
     use crate::tests::harness::TestHarness;
@@ -1067,4 +1197,186 @@ fn test_set_frame_places_a_floating_window() {
         Some(placed),
         "and sitting exactly where it was put"
     );
+}
+/// The numbers of the test space's virtual workspaces, in order: those there
+/// are, not the gaps the query state fills in.
+#[cfg(feature = "lua")]
+fn workspace_numbers(world: &mut World) -> Vec<u32> {
+    let mut numbers: Vec<u32> = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .filter(|strip| strip.id() == TEST_WORKSPACE_ID)
+        .map(|strip| strip.virtual_index + 1)
+        .collect();
+    numbers.sort_unstable();
+    numbers
+}
+
+#[cfg(feature = "lua")]
+fn reaping(on: bool) -> Config {
+    use crate::config::MainOptions;
+
+    (
+        MainOptions {
+            reap_empty_workspaces: Some(on),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into()
+}
+
+/// Windows 1 and 2 sent to workspaces 2 and 3, staying on 1, then window 1
+/// brought back: workspace 2 is left empty, behind the active one's back.
+#[cfg(feature = "lua")]
+fn empty_the_second(harness: &mut crate::tests::harness::TestHarness) {
+    empty_the_second_with(harness, &mut |_| true);
+}
+
+/// As `empty_the_second`, with `before` done to the world as the last window
+/// leaves.
+#[cfg(feature = "lua")]
+fn empty_the_second_with(
+    harness: &mut crate::tests::harness::TestHarness,
+    before: &mut dyn FnMut(&mut World) -> bool,
+) {
+    use crate::commands::Command;
+    use crate::types::windowset::LayoutOp;
+
+    harness.advance(std::time::Duration::from_millis(100));
+    for (window, workspace) in [(1, 2), (2, 3)] {
+        harness.app.world_mut().write_message(Event::Command {
+            command: Command::Layout(vec![LayoutOp::MoveToWorkspace {
+                window,
+                workspace,
+                follow: false,
+            }]),
+        });
+        harness.advance(std::time::Duration::from_millis(200));
+    }
+    assert_eq!(workspace_numbers(harness.world()), vec![1, 2, 3]);
+    assert!(before(harness.world()));
+    harness.app.world_mut().write_message(Event::Command {
+        command: Command::Layout(vec![LayoutOp::MoveToWorkspace {
+            window: 1,
+            workspace: 1,
+            follow: false,
+        }]),
+    });
+    harness.advance(std::time::Duration::from_millis(200));
+}
+
+#[cfg(feature = "lua")]
+#[test]
+fn test_a_workspace_emptied_behind_the_active_one_is_reaped_and_the_numbers_keep_their_gap() {
+    use crate::tests::harness::TestHarness;
+
+    let mut harness = TestHarness::new()
+        .with_config(reaping(true))
+        .with_windows(3);
+    empty_the_second(&mut harness);
+
+    // Three stays three: a script that remembered "3" still finds its
+    // windows there.
+    assert_eq!(workspace_numbers(harness.world()), vec![1, 3]);
+
+    // And the next one down is three, over the gap.
+    harness.app.world_mut().write_message(Event::Command {
+        command: crate::commands::Command::Window(crate::commands::Operation::Virtual(
+            crate::commands::Direction::South,
+        )),
+    });
+    harness.advance(std::time::Duration::from_millis(300));
+    let state = extract_query_state(harness.world()).expect("query state extraction");
+    assert_eq!(state.active.virtual_workspace_number, Some(3));
+}
+
+#[cfg(feature = "lua")]
+#[test]
+fn test_an_emptied_workspace_stays_with_reaping_off() {
+    use crate::tests::harness::TestHarness;
+
+    let mut harness = TestHarness::new()
+        .with_config(reaping(false))
+        .with_windows(3);
+    empty_the_second(&mut harness);
+
+    assert_eq!(workspace_numbers(harness.world()), vec![1, 2, 3]);
+}
+
+#[cfg(feature = "lua")]
+#[test]
+fn test_the_active_workspace_stays_when_its_last_window_closes() {
+    use crate::commands::Command;
+    use crate::tests::harness::TestHarness;
+    use crate::types::windowset::LayoutOp;
+
+    let mut harness = TestHarness::new()
+        .with_config(reaping(true))
+        .with_windows(2);
+    harness.advance(std::time::Duration::from_millis(100));
+    harness.app.world_mut().write_message(Event::Command {
+        command: Command::Layout(vec![LayoutOp::MoveToWorkspace {
+            window: 1,
+            workspace: 2,
+            follow: true,
+        }]),
+    });
+    harness.advance(std::time::Duration::from_millis(300));
+    assert_eq!(workspace_numbers(harness.world()), vec![1, 2]);
+
+    harness.mock_state.os_close_window(1);
+    harness.advance(std::time::Duration::from_millis(300));
+
+    // Shown and empty: what the display shows is still there.
+    assert_eq!(workspace_numbers(harness.world()), vec![1, 2]);
+    let state = extract_query_state(harness.world()).expect("query state extraction");
+    assert_eq!(state.active.virtual_workspace_number, Some(2));
+}
+
+#[cfg(feature = "lua")]
+#[test]
+fn test_a_workspace_shown_on_its_display_stays_when_emptied() {
+    use crate::tests::harness::TestHarness;
+
+    let mut harness = TestHarness::new()
+        .with_config(reaping(true))
+        .with_windows(3);
+    // As another display's shown workspace is marked once it's not the
+    // active one.
+    let mut select_second = |world: &mut World| {
+        let second = world
+            .query::<(Entity, &LayoutStrip)>()
+            .iter(world)
+            .find(|(_, strip)| strip.id() == TEST_WORKSPACE_ID && strip.virtual_index == 1)
+            .map(|(entity, _)| entity);
+        if let Some(entity) = second {
+            world.entity_mut(entity).insert(SelectedVirtualMarker);
+        }
+        second.is_some()
+    };
+    empty_the_second_with(&mut harness, &mut select_second);
+
+    assert_eq!(workspace_numbers(harness.world()), vec![1, 2, 3]);
+}
+
+#[cfg(feature = "lua")]
+#[test]
+fn test_a_workspace_made_empty_stays() {
+    use crate::commands::Command;
+    use crate::tests::harness::TestHarness;
+    use crate::types::windowset::LayoutOp;
+
+    let mut harness = TestHarness::new()
+        .with_config(reaping(true))
+        .with_windows(1);
+    harness.advance(std::time::Duration::from_millis(100));
+    // Viewing a number past the last makes it, empty, and shows it; viewing
+    // the first again leaves it to the existing reap, which takes it then.
+    harness.app.world_mut().write_message(Event::Command {
+        command: Command::Layout(vec![LayoutOp::View { workspace: 2 }]),
+    });
+    harness.advance(std::time::Duration::from_millis(300));
+
+    assert_eq!(workspace_numbers(harness.world()), vec![1, 2]);
 }

@@ -17,8 +17,8 @@ use crate::ecs::params::Windows;
 use crate::ecs::workspace::{PreviousStripPosition, SnapStripMarker};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
-    ManualStripOffset, Position, RepositionMarker, ReshuffleAroundMarker, ResizeMarker, Scrolling,
-    SpawnCommandsExt,
+    ManualStripOffset, Position, RepositionMarker, ReshuffleAroundMarker, ResizeAnchor,
+    ResizeMarker, Scrolling, SpawnCommandsExt,
 };
 use crate::errors::{Error, Result};
 use crate::manager::{Display, Origin, Size, Window};
@@ -759,10 +759,18 @@ impl LayoutStrip {
             // Can not stack to the left if left most window already.
             return Ok(());
         }
+        // A native full-screen window keeps its column to itself: checked
+        // before either column is taken out, so neither is lost.
+        if [index, index - 1]
+            .iter()
+            .any(|&at| matches!(self.columns.get(at), Some(Column::Fullscren(_))))
+        {
+            return Ok(());
+        }
 
         let column_to_stack = self.columns.remove(index).unwrap();
         let items_to_stack = match column_to_stack {
-            Column::Fullscren(_) => return Ok(()),
+            Column::Fullscren(_) => unreachable!("checked above"),
             Column::Single(id) => vec![StackItem::Single(id)],
             Column::Tabs(tabs) => vec![StackItem::Tabs(tabs)],
             Column::Stack(items) => items,
@@ -785,7 +793,7 @@ impl LayoutStrip {
             }
         }
         let new_column = match target_column {
-            Column::Fullscren(_) => return Ok(()),
+            Column::Fullscren(_) => unreachable!("checked above"),
             Column::Single(id) => {
                 Column::Stack([vec![StackItem::Single(id)], items_to_stack].concat())
             }
@@ -990,6 +998,33 @@ impl LayoutStrip {
                 (column, temp)
             })
         })
+    }
+
+    /// The window to take over focus from `entity` as it goes, as niri picks
+    /// it: the one below it in its stack, else the one above; else `opener`,
+    /// the window it was opened from, if that is still in the column to its
+    /// left; else the column to its right, or at the strip's right edge the
+    /// one to its left.
+    pub fn heir(&self, entity: Entity, opener: Option<Entity>) -> Option<Entity> {
+        let index = self.index_of(entity).ok()?;
+        if let Ok(Column::Stack(items)) = self.get(index)
+            && let Some(pos) = items.iter().position(|item| item.contains(entity))
+        {
+            let mate = items
+                .get(pos + 1)
+                .or_else(|| pos.checked_sub(1).and_then(|above| items.get(above)))
+                .and_then(StackItem::top);
+            if mate.is_some() {
+                return mate;
+            }
+        }
+        if let Some(opener) = opener
+            && self.index_of(opener).is_ok_and(|at| at + 1 == index)
+        {
+            return Some(opener);
+        }
+        self.right_neighbour(entity)
+            .or_else(|| self.left_neighbour(entity))
     }
 
     pub fn above(&self, entity: Entity) -> Option<Entity> {
@@ -1299,10 +1334,12 @@ fn resolve_strip_scroll_context<'a>(
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn reshuffle_layout_strip(
     markers: ReshuffleMarkers,
     strips: StripPlacements,
     manual_offsets: Query<&ManualStripOffset>,
+    anchors: Query<&ResizeAnchor>,
     displays: DisplayViewports,
     windows: Windows,
     config: Res<Config>,
@@ -1311,6 +1348,9 @@ pub(super) fn reshuffle_layout_strip(
     markers.into_iter().for_each(|(entity, layout_position)| {
         if let Ok(mut cmd) = commands.get_entity(entity) {
             cmd.try_remove::<ReshuffleAroundMarker>();
+            if !windows.is_resizing(entity) {
+                cmd.try_remove::<ResizeAnchor>();
+            }
         }
         let Some(ctx) = resolve_strip_scroll_context(entity, &strips, &displays, &config) else {
             return;
@@ -1327,10 +1367,15 @@ pub(super) fn reshuffle_layout_strip(
         };
         let size = frame.size();
         // When a window is being resized (`ResizeMarker` present), keep its
-        // visual center anchored (`frame.center()`) unless `auto_center` or the
+        // visual center anchored (its `ResizeAnchor`) unless `auto_center` or the
         // edge invariant overrides it; for non-resize reshuffles, project from
         // its logical slot in the strip (`layout_position.0 + strip_target`).
-        let resizing = windows.is_resizing(entity);
+        let resizing = windows.is_resizing(entity) || anchors.contains(entity);
+        let resize_center = anchors
+            .get(entity)
+            .map(|anchor| anchor.0)
+            .ok()
+            .or_else(|| windows.frame(entity).map(|frame| frame.center().x));
 
         let display_bounds = ctx.display_bounds;
         let projected_min = layout_position.0 + ctx.strip_target;
@@ -1374,8 +1419,8 @@ pub(super) fn reshuffle_layout_strip(
         let mut desired_min = projected_min;
         if config.auto_center() {
             desired_min.x = ctx.raw_display_bounds.center().x - size.x / 2;
-        } else if resizing && let Some(current_frame) = windows.frame(entity) {
-            desired_min.x = IRect::from_center_size(current_frame.center(), size).min.x;
+        } else if resizing && let Some(center) = resize_center {
+            desired_min.x = center - size.x / 2;
         }
         let clamped_min = clamp_origin_to_viewport(desired_min, size, display_bounds);
 
@@ -2025,6 +2070,20 @@ mod tests {
         strip.append(entities[2]);
 
         (world, strip, entities)
+    }
+
+    #[test]
+    fn stack_leaves_a_fullscreen_column_and_its_neighbour_in_place() {
+        let mut world = World::new();
+        let entities = world.spawn_batch(vec![(), ()]).collect::<Vec<Entity>>();
+        let mut strip = LayoutStrip::fullscreen(1, entities[0]);
+        strip.append(entities[1]);
+
+        strip.stack(entities[1]).unwrap();
+
+        assert_eq!(strip.len(), 2);
+        assert!(strip.is_fullscreen());
+        assert_eq!(strip.index_of(entities[1]).unwrap(), 1);
     }
 
     #[test]

@@ -1,12 +1,13 @@
 use bevy::ecs::change_detection::DetectChangesMut;
 use bevy::ecs::entity::Entity;
 use bevy::ecs::hierarchy::{ChildOf, Children};
-use bevy::ecs::lifecycle::{Add, Remove, RemovedComponents};
+use bevy::ecs::lifecycle::{Add, Insert, Remove, RemovedComponents};
 use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With, Without};
 use bevy::ecs::system::{Commands, NonSendMut, ParamSet, Populated, Query, Res, ResMut, Single};
 use bevy::math::IRect;
+use bevy::time::{Time, Timer, TimerMode};
 use notify::event::{DataChange, MetadataKind, ModifyKind};
 use notify::{EventKind, Watcher};
 use std::cmp::Ordering;
@@ -14,9 +15,9 @@ use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    ActiveDisplayMarker, BProcess, FocusedMarker, FreshMarker, MissionControlActive,
-    PreviousManagedStrip, RetryFrontSwitch, SpawnWindowTrigger, StrayFocusEvent, SystemTheme,
-    Timeout, Unmanaged,
+    ActiveDisplayMarker, BProcess, FocusedMarker, FreshMarker, MissionControlActive, OpenedFrom,
+    PreviousManagedStrip, RetryFrontSwitch, SelectedVirtualMarker, SpawnWindowTrigger,
+    StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
 };
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
@@ -25,9 +26,9 @@ use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::RestoreFocusMarker;
 use crate::ecs::{
-    ActiveWorkspaceMarker, Bounds, DockPosition, Initializing, LayoutPosition, Position,
-    ResizeMarker, RestoreWindowState, Scrolling, SendMessageTrigger, SpawnCommandsExt,
-    VerifyWindowPosition, WidthRatio, WindowProperties,
+    ActiveWorkspaceMarker, AwaitResize, Bounds, DockPosition, Initializing, LayoutPosition,
+    Position, RepositionMarker, ResizeAnchor, ResizeMarker, RestoreWindowState, Scrolling,
+    SendMessageTrigger, SpawnCommandsExt, VerifyWindowPosition, WidthRatio, WindowProperties,
 };
 use crate::events::{DestroySource, Event};
 use crate::manager::{
@@ -475,6 +476,29 @@ pub(super) fn mission_control_trigger(
 
 /// Dispatches process-related messages, such as application launch and termination.
 ///
+const PROCESS_READY_TIMEOUT_SEC: u64 = 5;
+
+fn process_ready_timeout(name: &str, commands: &mut Commands) -> Timeout {
+    let timeout = Timeout::new(
+        Duration::from_secs(PROCESS_READY_TIMEOUT_SEC),
+        Some(format!(
+            "Process '{name}' did not become ready in {PROCESS_READY_TIMEOUT_SEC}s.",
+        )),
+        commands,
+    );
+    // Stop rapid polling after the grace period, but keep Process and its
+    // finishedLaunching/activationPolicy KVO so a late readiness notification
+    // can resume discovery within the recovery window.
+    Timeout {
+        on_expire: Some(|entity| {
+            entity.try_remove::<(FreshMarker, Timeout)>();
+        }),
+        ..timeout
+    }
+}
+
+/// Handles application launch and termination events.
+///
 /// # Arguments
 ///
 /// * `trigger` - The Bevy event trigger containing the application event.
@@ -485,7 +509,6 @@ pub(super) fn application_event_trigger(
     processes: Query<(&BProcess, Entity)>,
     mut commands: Commands,
 ) {
-    const PROCESS_READY_TIMEOUT_SEC: u64 = 5;
     let find_process = |psn| {
         processes
             .iter()
@@ -494,21 +517,32 @@ pub(super) fn application_event_trigger(
 
     for event in messages.read() {
         match event {
-            Event::ApplicationLaunched { psn, observer } if find_process(*psn).is_none() => {
+            Event::ApplicationLaunched { psn, observer } => {
+                if let Some((BProcess(process), entity)) = find_process(*psn) {
+                    // Readiness KVO uses the same message as the initial launch.
+                    // Re-arm an existing process instead of ignoring that signal.
+                    let timeout = process_ready_timeout(process.name(), &mut commands);
+                    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                        entity_commands.try_insert((
+                            FreshMarker,
+                            crate::ecs::systems::PendingWindowRecovery::default(),
+                            timeout,
+                        ));
+                    }
+                    continue;
+                }
                 let process: BProcess = Process::new(psn, observer.clone()).into();
                 if process.pid() == 0 {
                     debug!("Skipping process with PID 0 (likely kernel_task).");
                     continue;
                 }
-                let timeout = Timeout::new(
-                    Duration::from_secs(PROCESS_READY_TIMEOUT_SEC),
-                    Some(format!(
-                        "Process '{}' did not become ready in {PROCESS_READY_TIMEOUT_SEC}s.",
-                        process.name()
-                    )),
-                    &mut commands,
-                );
-                commands.spawn((FreshMarker, timeout, process));
+                let timeout = process_ready_timeout(process.name(), &mut commands);
+                commands.spawn((
+                    FreshMarker,
+                    crate::ecs::systems::PendingWindowRecovery::default(),
+                    timeout,
+                    process,
+                ));
             }
 
             Event::ApplicationTerminated { psn } => {
@@ -743,6 +777,7 @@ pub(super) fn window_minimized_trigger(
     windows: Windows,
     workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     active_display: Single<&Display, With<ActiveDisplayMarker>>,
+    openers: Query<&OpenedFrom>,
     mut config: GlobalState,
     mut commands: Commands,
 ) {
@@ -752,11 +787,16 @@ pub(super) fn window_minimized_trigger(
     {
         debug!("Entity {entity} is minimized or hidden.");
         let display_bounds = active_display.bounds();
+        let opener = openers.get(entity).ok().map(|opened| opened.0);
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<OpenedFrom>();
+        }
 
         for (mut strip, active) in workspaces {
             if active {
                 give_away_focus(
                     entity,
+                    opener,
                     &windows,
                     &strip,
                     &display_bounds,
@@ -912,8 +952,10 @@ pub(super) fn window_managed_trigger(
 /// * `global_state` - Focus-follows-mouse and reshuffle flags.
 /// * `focus_history` - Per-workspace record of what was focused last.
 /// * `windows` - A query for all windows with their parent.
+/// * `openers` - The window each window was opened from, if any.
 /// * `commands` - Bevy commands to despawn entities and trigger events.
 #[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn window_destroyed_trigger(
     mut messages: MessageReader<Event>,
     active_display: ActiveDisplay,
@@ -921,6 +963,7 @@ pub(super) fn window_destroyed_trigger(
     mut global_state: GlobalState,
     mut focus_history: ResMut<FocusHistory>,
     windows: Windows,
+    openers: Query<&OpenedFrom>,
     mut commands: Commands,
 ) {
     for event in messages.read() {
@@ -958,6 +1001,7 @@ pub(super) fn window_destroyed_trigger(
 
         give_away_focus(
             entity,
+            openers.get(entity).ok().map(|opened| opened.0),
             &windows,
             active_display.active_strip(),
             &active_display.bounds(),
@@ -992,12 +1036,22 @@ pub(super) fn invalidate_window_title(mut messages: MessageReader<Event>, window
 /// Moves the focus away to a neighbour window.
 fn give_away_focus(
     entity: Entity,
+    opener: Option<Entity>,
     windows: &Windows,
     active_strip: &LayoutStrip,
     viewport: &IRect,
     config: &mut GlobalState,
     commands: &mut Commands,
 ) {
+    // 2026-10-26: Dismissing an unfocused Emacs popup must not select another
+    // tile. Only the disappearing window that owns focus can give it away.
+    if windows
+        .focused()
+        .is_none_or(|(_, focused)| focused != entity)
+    {
+        return;
+    }
+
     if active_strip.is_tabbed_display(entity)
         && let Some(sibling) = active_strip.tab_display_sibling(entity)
     {
@@ -1017,18 +1071,24 @@ fn give_away_focus(
         // Remaining tab gets the focus.
         return;
     }
+    // The focused window going hands focus to its heir, so where focus lands
+    // never depends on where the strip happens to be scrolled.
     let display_center = viewport.center().x;
     let closest = active_strip
-        .all_columns()
-        .into_iter()
-        .filter(|&candidate| candidate != entity)
-        .filter_map(|candidate| {
-            let center = windows.moving_frame(candidate)?.center().x;
-            let distance = (center - display_center).abs();
-            Some((candidate, distance))
+        .heir(entity, opener)
+        .or_else(|| {
+            active_strip
+                .all_columns()
+                .into_iter()
+                .filter(|&candidate| candidate != entity)
+                .filter_map(|candidate| {
+                    let center = windows.moving_frame(candidate)?.center().x;
+                    let distance = (center - display_center).abs();
+                    Some((candidate, distance))
+                })
+                .min_by_key(|(_, dist)| *dist)
+                .map(|(e, _)| e)
         })
-        .min_by_key(|(_, dist)| *dist)
-        .map(|(e, _)| e)
         .or_else(|| {
             // Fallback when no candidate has a usable frame: pick any other
             // column in the strip. Without this, losing focus on the only
@@ -1133,6 +1193,9 @@ pub(super) fn spawn_window_trigger(
 
         // Insert the window into the internal Bevy state.
         // This insertion triggers window attributes observer.
+        if let Ok(mut app_commands) = commands.get_entity(app_entity) {
+            app_commands.try_remove::<crate::ecs::systems::PendingWindowRecovery>();
+        }
         commands.spawn((
             position,
             bounds,
@@ -1223,10 +1286,79 @@ pub(super) fn apply_window_defaults(
     }
 }
 
+/// Finds the strip a newly created window belongs to, as `(strip, is_active)`.
+///
+/// Asks the window server which Space holds the window, starting with the active strip's
+/// Space. For another Space the target is its selected virtual row, else its lowest
+/// `virtual_index` (the same pick as `workspace_change_handler`). When the Space cannot be
+/// determined the active strip is returned, which is the historical behavior.
+fn home_strip(
+    window_id: WinID,
+    strips: &[(Entity, &LayoutStrip, bool, bool)],
+    window_manager: &WindowManager,
+) -> Option<(Entity, bool)> {
+    let (active_entity, active_id) = strips
+        .iter()
+        .find_map(|&(entity, strip, active, _)| active.then_some((entity, strip.id())))?;
+    let on_space = |space_id| {
+        window_manager
+            .windows_in_workspace(space_id)
+            .is_ok_and(|windows| windows.contains(&window_id))
+    };
+    if on_space(active_id) {
+        return Some((active_entity, true));
+    }
+
+    let mut checked = vec![active_id];
+    for (_, strip, _, _) in strips {
+        if checked.contains(&strip.id()) {
+            continue;
+        }
+        checked.push(strip.id());
+        if !on_space(strip.id()) {
+            continue;
+        }
+        let target = strips
+            .iter()
+            .filter(|(_, other, _, _)| other.id() == strip.id() && !other.is_fullscreen())
+            .min_by_key(|(_, other, _, selected)| (!selected, other.virtual_index))
+            .map(|(entity, _, _, _)| entity);
+        if let Some(entity) = target {
+            return Some((*entity, false));
+        }
+    }
+    debug!("Space of new window {window_id} unknown, using the active strip.");
+    Some((active_entity, true))
+}
+
+/// Marks `entity` as opened from the focused window when it landed in the
+/// column right of it.
+fn remember_opener(
+    entity: Entity,
+    strip: &LayoutStrip,
+    windows: &Windows,
+    commands: &mut Commands,
+) {
+    if let Some((_, opener)) = windows.focused()
+        && let (Ok(at), Ok(from)) = (strip.index_of(entity), strip.index_of(opener))
+        && from + 1 == at
+        && let Ok(mut entity_commands) = commands.get_entity(entity)
+    {
+        entity_commands.try_insert(OpenedFrom(opener));
+    }
+}
+
 #[instrument(level = Level::DEBUG, skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub(super) fn apply_window_positions(
     added: Populated<Entity, Added<Window>>,
-    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    mut workspaces: Query<(
+        Entity,
+        &mut LayoutStrip,
+        Has<ActiveWorkspaceMarker>,
+        Has<SelectedVirtualMarker>,
+    )>,
+    window_manager: Res<WindowManager>,
     apps: Query<&Application>,
     initializing: Option<Res<Initializing>>,
     restore: Option<Res<crate::ecs::restore::SessionRestore>>,
@@ -1234,7 +1366,10 @@ pub(super) fn apply_window_positions(
     mut ctx: WindowCtx,
 ) {
     for entity in added {
-        if workspaces.iter().any(|(strip, _)| strip.tabbed(entity)) {
+        if workspaces
+            .iter()
+            .any(|(_, strip, _, _)| strip.tabbed(entity))
+        {
             debug!("Ignoring tabbed {entity} attributes.");
             continue;
         }
@@ -1265,7 +1400,7 @@ pub(super) fn apply_window_positions(
         if properties.floating() {
             if let Some(mut strip) = workspaces
                 .iter_mut()
-                .find_map(|(strip, _)| strip.contains(entity).then_some(strip))
+                .find_map(|(_, strip, _, _)| strip.contains(entity).then_some(strip))
             {
                 strip.remove(entity);
             }
@@ -1278,36 +1413,48 @@ pub(super) fn apply_window_positions(
 
         // During startup, the window is already inserted into some strip by finish_setup.
         let allready_inserted = workspaces
-            .iter_mut()
-            .find_map(|(strip, _)| strip.contains(entity).then_some(strip));
+            .iter()
+            .any(|(_, strip, _, _)| strip.contains(entity));
+        let mut on_hidden_space = false;
         if initializing.is_none()
-            && allready_inserted.is_none()
-            && let Some(mut strip) = workspaces
-                .iter_mut()
-                .find_map(|(strip, active)| active.then_some(strip))
+            && !allready_inserted
+            && let Some((target, is_active)) = home_strip(
+                window.id(),
+                &workspaces.iter().collect::<Vec<_>>(),
+                &window_manager,
+            )
+            && let Ok((_, mut strip, _, _)) = workspaces.get_mut(target)
         {
-            // Attempt inserting the window at a pre-defined position.
-            let insert_at = properties.insertion().map_or_else(
-                || {
-                    // Otherwise attempt inserting it after the current focus.
-                    let focused_window = ctx.windows.focused();
-                    // Insert to the right of the currently focused window
-                    focused_window
-                        .and_then(|(_, entity)| strip.index_of(entity).ok())
-                        .and_then(|insert_at| {
-                            (insert_at + 1 < strip.len()).then_some(insert_at + 1)
-                        })
-                },
-                Some,
-            );
+            if is_active {
+                // Attempt inserting the window at a pre-defined position.
+                let insert_at = properties.insertion().map_or_else(
+                    || {
+                        // Otherwise attempt inserting it after the current focus.
+                        let focused_window = ctx.windows.focused();
+                        // Insert to the right of the currently focused window
+                        focused_window
+                            .and_then(|(_, entity)| strip.index_of(entity).ok())
+                            .and_then(|insert_at| {
+                                (insert_at + 1 < strip.len()).then_some(insert_at + 1)
+                            })
+                    },
+                    Some,
+                );
 
-            debug!("New window {entity} adding at {}", *strip);
-            match insert_at {
-                Some(after) => {
-                    debug!("New window inserted at {after}");
-                    strip.insert_at(after, entity);
+                debug!("New window {entity} adding at {}", *strip);
+                match insert_at {
+                    Some(after) => {
+                        debug!("New window inserted at {after}");
+                        strip.insert_at(after, entity);
+                    }
+                    None => strip.append(entity),
                 }
-                None => strip.append(entity),
+                remember_opener(entity, &strip, &ctx.windows, &mut ctx.commands);
+            } else {
+                // The window opened on a Space the user is not looking at.
+                debug!("New window {entity} appended to inactive {}", *strip);
+                strip.append(entity);
+                on_hidden_space = true;
             }
         }
 
@@ -1322,7 +1469,7 @@ pub(super) fn apply_window_positions(
                     );
                     ctx.commands.focus_entity(prev, true);
                 }
-            } else {
+            } else if !on_hidden_space {
                 debug!("Synthesizing WindowFocused for newly spawned window {entity}");
                 ctx.commands
                     .trigger(SendMessageTrigger(Event::WindowFocused {
@@ -1442,15 +1589,91 @@ pub(super) fn cleanup_timeout_trigger(
     }
 }
 
+/// How long a slow app has to apply a requested size before the window counts
+/// as having refused it.
+const RESIZE_REFUSAL_TIMEOUT: Duration = Duration::from_secs(1);
+
+type UnanchoredWindows<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static Position,
+        Option<&'static RepositionMarker>,
+        &'static Bounds,
+        Option<&'static AwaitResize>,
+    ),
+    Without<ResizeAnchor>,
+>;
+
+type ResizedWindows<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static mut Window,
+        &'static Position,
+        Option<&'static RepositionMarker>,
+        &'static mut Bounds,
+        Option<&'static ResizeAnchor>,
+        Has<FocusedMarker>,
+    ),
+>;
+
+type RefusedResizes<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        Entity,
+        &'static Position,
+        Option<&'static RepositionMarker>,
+        &'static mut AwaitResize,
+    ),
+>;
+
+/// Records the center a window resizes around. A resize that starts while an
+/// earlier one waits on the app, with the window still in place, keeps the
+/// earlier center.
+pub(super) fn record_resize_anchor(
+    trigger: On<Insert, ResizeMarker>,
+    windows: UnanchoredWindows,
+    mut commands: Commands,
+) {
+    let entity = trigger.event().entity;
+    let Ok((position, reposition, bounds, waiting)) = windows.get(entity) else {
+        return;
+    };
+    let x = destination_x(position, reposition);
+    let center = waiting.filter(|waiting| waiting.x == x).map_or_else(
+        || {
+            IRect::from_corners(position.0, position.0 + bounds.0)
+                .center()
+                .x
+        },
+        |waiting| x + waiting.anchor_offset,
+    );
+    if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        entity_commands.try_insert(ResizeAnchor(center));
+        entity_commands.try_remove::<AwaitResize>();
+    }
+}
+
 pub(super) fn window_resize_verifier(
     mut removed: RemovedComponents<ResizeMarker>,
-    mut windows: Query<(&mut Window, &Position, &mut Bounds)>,
+    resizing: Query<(), With<ResizeMarker>>,
+    mut windows: ResizedWindows,
     layout_strips: Query<&LayoutStrip>,
     mut commands: Commands,
 ) {
     use std::cmp::Ordering;
     for entity in removed.read() {
-        let Ok((mut window, _, mut bounds)) = windows.get_mut(entity) else {
+        if resizing.contains(entity) {
+            continue;
+        }
+        let Ok(mut entity_commands) = commands.get_entity(entity) else {
+            continue;
+        };
+        entity_commands.try_remove::<ResizeAnchor>();
+        let Ok((mut window, position, reposition, mut bounds, anchor, _)) = windows.get_mut(entity)
+        else {
             continue;
         };
         let Ok(frame) = window.update_frame() else {
@@ -1460,11 +1683,7 @@ pub(super) fn window_resize_verifier(
         let actual_size = frame.size();
         let expected_size = bounds.0;
 
-        // note: macOS loves to make window sizes to even numbers, so we treat actual+1 as equal.
-        let width_ord = fuzzy_equal(actual_size.x, expected_size.x);
-        let height_ord = fuzzy_equal(actual_size.y, expected_size.y);
-
-        if width_ord == Ordering::Equal && height_ord == Ordering::Equal {
+        if sizes_match(actual_size, expected_size) {
             continue;
         }
         debug!(
@@ -1474,6 +1693,15 @@ pub(super) fn window_resize_verifier(
             expected_size,
             actual_size,
         );
+        if let Some(anchor) = anchor {
+            let x = destination_x(position, reposition);
+            entity_commands.try_insert(AwaitResize {
+                timer: Timer::new(RESIZE_REFUSAL_TIMEOUT, TimerMode::Once),
+                requested: expected_size,
+                x,
+                anchor_offset: anchor.0 - x,
+            });
+        }
         bounds.0 = actual_size;
 
         // we may hitting minimum width constraint on this window or this window isn't resizable.
@@ -1483,7 +1711,7 @@ pub(super) fn window_resize_verifier(
         //
         // note that those windows might have max window constraints or isn't resiable.
         // so we need to ignore cases where windows are failing to expand to the target.
-        if width_ord == Ordering::Less {
+        if fuzzy_equal(actual_size.x, expected_size.x) == Ordering::Less {
             let Some(column) = layout_strips.iter().find_map(|strip| {
                 strip
                     .index_of(entity)
@@ -1496,7 +1724,7 @@ pub(super) fn window_resize_verifier(
             let get_window_frame = |entity| {
                 windows
                     .get(entity)
-                    .map(|(_, position, bounds)| {
+                    .map(|(_, position, _, bounds, _, _)| {
                         IRect::from_corners(position.0, position.0 + bounds.0)
                     })
                     .ok()
@@ -1518,6 +1746,99 @@ pub(super) fn window_resize_verifier(
                 });
         }
     }
+}
+
+/// Reconciles the native column after grace and restores placement around its
+/// focused member if any member still refuses the requested size.
+pub(super) fn settle_refused_resize(
+    mut waiting: RefusedResizes,
+    mut windows: ResizedWindows,
+    resizing: Query<(), With<ResizeMarker>>,
+    layout_strips: Query<&LayoutStrip>,
+    time: Res<Time>,
+    mut commands: Commands,
+) {
+    for (entity, position, reposition, mut wait) in &mut waiting {
+        if !wait.timer.tick(time.delta()).is_finished() {
+            continue;
+        }
+        let column = layout_strips.iter().find_map(|strip| {
+            strip
+                .index_of(entity)
+                .ok()
+                .and_then(|idx| strip.get(idx).ok())
+        });
+        if column
+            .as_ref()
+            .is_some_and(|column| column.window_iter().any(|member| resizing.contains(member)))
+        {
+            continue;
+        }
+        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+            entity_commands.try_remove::<AwaitResize>();
+        }
+        if destination_x(position, reposition) != wait.x {
+            continue;
+        }
+        let Some(column) = column else {
+            continue;
+        };
+        let mut owner = None;
+        let mut refused = false;
+        let mut complete = true;
+        let mut column_width = 0;
+        for member in column.window_iter() {
+            let Ok((mut window, position, reposition, mut bounds, _, focused)) =
+                windows.get_mut(member)
+            else {
+                complete = false;
+                continue;
+            };
+            let Ok(frame) = window.update_frame() else {
+                complete = false;
+                continue;
+            };
+            let size = frame.size();
+            column_width = column_width.max(size.x);
+            if bounds.0 != size {
+                bounds.0 = size;
+            }
+            if member == entity {
+                refused = !sizes_match(size, wait.requested);
+            }
+            if focused && destination_x(position, reposition) == wait.x {
+                owner = Some(member);
+            }
+        }
+        if !complete {
+            continue;
+        }
+        // Layout uses the master's width for every stack member. Keep the
+        // widest accepted width so a refusing sibling cannot be overwritten.
+        for member in column.window_iter() {
+            if let Ok((_, _, _, mut bounds, _, _)) = windows.get_mut(member)
+                && bounds.0.x != column_width
+            {
+                bounds.0.x = column_width;
+            }
+        }
+        if refused && let Some(owner) = owner {
+            if let Ok(mut entity_commands) = commands.get_entity(owner) {
+                entity_commands.try_insert(ResizeAnchor(wait.x + wait.anchor_offset));
+            }
+            commands.reshuffle_around(owner);
+        }
+    }
+}
+
+fn destination_x(position: &Position, reposition: Option<&RepositionMarker>) -> i32 {
+    reposition.map_or(position.0.x, |target| target.0.x)
+}
+
+fn sizes_match(actual: Size, expected: Size) -> bool {
+    // note: macOS loves to make window sizes to even numbers, so we treat actual+1 as equal.
+    fuzzy_equal(actual.x, expected.x) == Ordering::Equal
+        && fuzzy_equal(actual.y, expected.y) == Ordering::Equal
 }
 
 fn fuzzy_equal<N>(actual_size: N, expected_size: N) -> Ordering

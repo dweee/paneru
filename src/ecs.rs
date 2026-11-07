@@ -260,6 +260,10 @@ pub fn register_systems(app: &mut bevy::app::App) {
     app.add_systems(
         Update,
         (
+            systems::retry_application_observers.run_if(on_timer(CLOSED_WINDOW_CHECK_FREQ)),
+            systems::recover_windowless_applications
+                .run_if(not(resource_exists::<Initializing>))
+                .run_if(on_timer(CLOSED_WINDOW_CHECK_FREQ)),
             systems::add_launched_process.run_if(on_timer(APP_OBSERVABILITY_CHECK_FREQ)),
             systems::add_launched_application.run_if(on_timer(APP_OBSERVABILITY_CHECK_FREQ)),
             (
@@ -349,6 +353,7 @@ pub fn register_triggers(app: &mut bevy::app::App) {
             triggers::refresh_configuration_trigger,
             triggers::theme_change_trigger,
             triggers::window_resize_verifier,
+            triggers::settle_refused_resize.after(triggers::window_resize_verifier),
         )
             .in_set(UpdateSet::Events),
     );
@@ -365,6 +370,7 @@ pub fn register_triggers(app: &mut bevy::app::App) {
         .add_observer(triggers::send_message_trigger)
         .add_observer(triggers::window_removal_trigger)
         .add_observer(triggers::cleanup_timeout_trigger)
+        .add_observer(triggers::record_resize_anchor)
         .add_observer(restore::restore_window_state);
 }
 
@@ -400,6 +406,26 @@ pub struct RepositionMarker(pub Origin);
 /// Component representing a request to resize a window.
 #[derive(Component, Debug, Deref, DerefMut)]
 pub struct ResizeMarker(pub Size);
+
+/// A window whose app had not applied the requested size when its resize
+/// animation ended. A slow app may still apply it, so the window counts as
+/// having refused it only once the timer runs out.
+#[derive(Component, Debug)]
+pub struct AwaitResize {
+    pub timer: Timer,
+    pub requested: Size,
+    /// Where the refused resize placed the window's left edge. Once anything
+    /// else moves the window, the wait no longer applies.
+    pub x: i32,
+    /// The window's `ResizeAnchor`, relative to `x`.
+    pub anchor_offset: i32,
+}
+
+/// The horizontal center a window had before its current run of resizes. The
+/// layout keeps a resizing window centered on it, so a size the app refuses
+/// puts the window back where it was.
+#[derive(Component, Debug)]
+pub struct ResizeAnchor(pub i32);
 
 /// Marker component indicating that windows around the marked entity need to be reshuffled.
 #[derive(Component)]
@@ -490,6 +516,11 @@ pub enum Unmanaged {
     Hidden,
 }
 
+/// The window a window was opened from, as the column to its right. Closing
+/// it before focus moves to another column hands focus back there.
+#[derive(Clone, Component, Copy, Debug)]
+pub struct OpenedFrom(pub Entity);
+
 #[derive(Clone, Component, Copy, Debug)]
 pub struct PreviousManagedStrip {
     pub workspace_id: WorkspaceId,
@@ -574,11 +605,14 @@ pub struct StrayFocusEvent(pub WinID);
 #[derive(Component)]
 pub struct RetryFrontSwitch(pub Entity);
 
-/// Marker component attached to a window after a keyboard focus request to
-/// verify whether the application accepted or rejected focus once the settle
-/// [`Timeout`] completes.
-#[derive(Component)]
-pub struct VerifyFocus;
+/// Attached to a window after a keyboard focus request to verify whether the
+/// application accepted or rejected focus once the settle [`Timeout`] completes.
+/// `asked_again` is set once the request has been repeated for an application
+/// that had not answered the first one.
+#[derive(Component, Default)]
+pub struct VerifyFocus {
+    pub asked_again: bool,
+}
 
 #[derive(Component)]
 pub struct BruteforceWindows(Task<Vec<Window>>);

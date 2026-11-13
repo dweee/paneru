@@ -1712,6 +1712,77 @@ fn test_mouse_to_next_display_preserves_selected_virtual_workspace() {
         .run(commands);
 }
 
+#[test]
+fn test_horizontal_mouse_warp_also_warps_a_drag() {
+    let config: Config = (
+        MainOptions {
+            horizontal_mouse_warp: Some(1),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let above = IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0);
+    let approach = objc2_core_foundation::CGPoint {
+        x: f64::from(TEST_DISPLAY_WIDTH - 20),
+        y: f64::from(TEST_DISPLAY_HEIGHT / 2),
+    };
+    let edge = objc2_core_foundation::CGPoint {
+        x: f64::from(TEST_DISPLAY_WIDTH - 1),
+        y: f64::from(TEST_DISPLAY_HEIGHT / 2),
+    };
+    let modifiers = crate::platform::Modifiers::empty();
+    for (first, second) in [
+        (
+            Event::MouseMoved {
+                point: approach,
+                modifiers,
+            },
+            Event::MouseMoved {
+                point: edge,
+                modifiers,
+            },
+        ),
+        (
+            Event::MouseDragged {
+                point: approach,
+                modifiers,
+            },
+            Event::MouseDragged {
+                point: edge,
+                modifiers,
+            },
+        ),
+    ] {
+        let label = format!("{second:?}");
+        let commands = vec![
+            Event::MenuOpened { window_id: 0 },
+            Event::Command {
+                command: Command::PrintState,
+            },
+            Event::Command {
+                command: Command::PrintState,
+            },
+        ];
+        TestHarness::new()
+            .with_config(config.clone())
+            .with_windows(1)
+            .with_display(EXT_DISPLAY_ID, above, vec![EXT_WORKSPACE_ID])
+            .on_iteration(1, move |world, _state| {
+                world.write_message(first.clone());
+                world.write_message(second.clone());
+            })
+            .on_iteration(2, move |_world, state| {
+                let cursor = state.cursor_position();
+                assert!(
+                    above.contains(cursor),
+                    "{label} at the right edge left the pointer at {cursor:?}"
+                );
+            })
+            .run(commands);
+    }
+}
+
 /// A window's width is kept as a share of its own display, not of the one
 /// with focus: 960 wide on the 1920 monitor is half, though the laptop has
 /// focus.
@@ -1886,3 +1957,132 @@ fn test_remove_unfocused_display_keeps_the_shown_row() {
         assert!(state.create_window(0).frame().min.y < parked_y);
     });
 }
+
+#[test]
+fn test_remove_display_keeps_windows_whose_space_is_destroyed() {
+    let mut harness = TestHarness::new()
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_windows(2)
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |_| {})
+        .with_workspace_window(101, EXT_WORKSPACE_ID, |_| {});
+
+    harness
+        .app
+        .insert_resource(TimeUpdateStrategy::ManualDuration(Duration::from_millis(
+            500,
+        )));
+
+    let commands = vec![
+        Event::MenuOpened { window_id: 0 },
+        Event::DisplayRemoved {
+            display_id: EXT_DISPLAY_ID,
+        },
+    ];
+
+    harness
+        .on_iteration(0, |world, state| {
+            state.remove_display(EXT_DISPLAY_ID);
+            state.update_window(100, |w| w.workspace_id = TEST_WORKSPACE_ID);
+            state.update_window(101, |w| w.workspace_id = TEST_WORKSPACE_ID);
+            world.write_message(Event::SpaceDestroyed {
+                space_id: EXT_WORKSPACE_ID,
+            });
+        })
+        .on_iteration(1, |world, _state| {
+            let win100 = find_window_entity(100, world);
+            let win101 = find_window_entity(101, world);
+            let main_strips: Vec<(u32, Vec<Entity>)> = world
+                .query::<&LayoutStrip>()
+                .iter(world)
+                .filter(|s| s.id() == TEST_WORKSPACE_ID)
+                .map(|s| (s.virtual_index, s.all_windows()))
+                .collect();
+            assert!(
+                main_strips
+                    .iter()
+                    .any(|(_, windows)| windows.contains(&win100) && windows.contains(&win101)),
+                "windows from the destroyed space must land in a strip on the surviving display: {main_strips:?}"
+            );
+        })
+        .run(commands);
+}
+
+#[test]
+fn test_remove_display_keeps_windows_when_the_space_goes_after_the_display() {
+    let mut harness = TestHarness::new()
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_windows(2)
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |_| {})
+        .with_workspace_window(101, EXT_WORKSPACE_ID, |_| {});
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    harness.mock_state.remove_display(EXT_DISPLAY_ID);
+    harness
+        .mock_state
+        .update_window(100, |w| w.workspace_id = TEST_WORKSPACE_ID);
+    harness
+        .mock_state
+        .update_window(101, |w| w.workspace_id = TEST_WORKSPACE_ID);
+    harness.world().write_message(Event::DisplayRemoved {
+        display_id: EXT_DISPLAY_ID,
+    });
+    harness.advance(Duration::from_millis(100));
+    harness.world().write_message(Event::SpaceDestroyed {
+        space_id: EXT_WORKSPACE_ID,
+    });
+    harness.advance(Duration::from_secs(2));
+
+    let world = harness.world();
+    let win100 = find_window_entity(100, world);
+    let win101 = find_window_entity(101, world);
+    let main_strips: Vec<(u32, Vec<Entity>)> = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .filter(|s| s.id() == TEST_WORKSPACE_ID)
+        .map(|s| (s.virtual_index, s.all_windows()))
+        .collect();
+    assert!(
+        main_strips
+            .iter()
+            .any(|(_, windows)| windows == &vec![win100, win101]),
+        "windows from the destroyed space must keep their order on the surviving display: {main_strips:?}"
+    );
+}
+
+#[test]
+fn test_destroyed_space_on_a_present_display_is_not_orphaned() {
+    let mut harness = TestHarness::new()
+        .with_display(
+            EXT_DISPLAY_ID,
+            IRect::new(0, -EXT_DISPLAY_HEIGHT, EXT_DISPLAY_WIDTH, 0),
+            vec![EXT_WORKSPACE_ID],
+        )
+        .with_windows(1)
+        .with_workspace_window(100, EXT_WORKSPACE_ID, |_| {});
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+
+    harness.world().write_message(Event::SpaceDestroyed {
+        space_id: EXT_WORKSPACE_ID,
+    });
+    harness.advance(Duration::from_millis(100));
+
+    let world = harness.world();
+    let leftover = world
+        .query::<&LayoutStrip>()
+        .iter(world)
+        .filter(|strip| strip.id() == EXT_WORKSPACE_ID)
+        .count();
+    assert_eq!(
+        leftover, 0,
+        "a space destroyed on a connected display is dropped, as before"
+    );
+}
+

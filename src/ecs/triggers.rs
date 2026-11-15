@@ -6,6 +6,7 @@ use bevy::ecs::message::{MessageReader, MessageWriter};
 use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Has, With, Without};
 use bevy::ecs::system::{Commands, NonSendMut, ParamSet, Populated, Query, Res, ResMut, Single};
+use bevy::ecs::world::EntityWorldMut;
 use bevy::math::IRect;
 use bevy::time::{Time, Timer, TimerMode};
 use notify::event::{DataChange, MetadataKind, ModifyKind};
@@ -861,6 +862,19 @@ pub(super) fn window_managed_trigger(
     {
         let properties = WindowProperties::new(app, window, &ctx.config);
 
+        // A window that opened floating never got the padding that
+        // `apply_window_defaults` gives a tiled one.
+        let vertical = properties.vertical_padding().clamp(0, 50);
+        let horizontal = properties.horizontal_padding().clamp(0, 50);
+        if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
+            entity_commands.queue_silenced(move |mut entity: EntityWorldMut| {
+                if let Some(mut window) = entity.get_mut::<Window>() {
+                    window.set_padding(WindowPadding::Vertical(vertical));
+                    window.set_padding(WindowPadding::Horizontal(horizontal));
+                }
+            });
+        }
+
         // Re-managing an existing window (e.g. after un-floating it) retains
         // its width under the dynamic rule. Fixed rules keep their old behavior.
         if let Some(width_ratio) = properties.fixed_width_ratio() {
@@ -1349,7 +1363,7 @@ fn remember_opener(
 }
 
 #[instrument(level = Level::DEBUG, skip_all)]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(super) fn apply_window_positions(
     added: Populated<Entity, Added<Window>>,
     mut workspaces: Query<(
@@ -1407,6 +1421,15 @@ pub(super) fn apply_window_positions(
             if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
                 // Avoid managing window if it's floating.
                 entity_commands.try_insert(Unmanaged::Floating);
+            }
+            // As for a tiled window below: the window may have taken focus
+            // before Paneru tracked its app, so no focus event will follow.
+            if initializing.is_none() && !properties.dont_focus() {
+                debug!("Synthesizing WindowFocused for newly spawned floating window {entity}");
+                ctx.commands
+                    .trigger(SendMessageTrigger(Event::WindowFocused {
+                        window_id: window.id(),
+                    }));
             }
             continue;
         }
@@ -1555,16 +1578,33 @@ pub(super) fn refresh_configuration_trigger(
 
 pub(super) fn window_removal_trigger(
     trigger: On<Remove, Window>,
-    mut workspaces: Query<&mut LayoutStrip>,
+    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    windows: Windows,
+    global_state: GlobalState,
+    mut commands: Commands,
 ) {
     let entity = trigger.event().entity;
 
-    if let Some(mut strip) = workspaces.iter_mut().find(|strip| strip.contains(entity)) {
+    if let Some((mut strip, active)) = workspaces
+        .iter_mut()
+        .find(|(strip, _)| strip.contains(entity))
+    {
         debug!(
             "Removing despawned entity {entity} from strip {}",
             strip.id()
         );
         strip.remove(entity);
+
+        // The strip's origin stays put, so closing a column left of the
+        // focused window pulls it left and can push it off screen.
+        if active
+            && !global_state.skip_reshuffle()
+            && !global_state.initializing()
+            && let Some((_, focused)) = windows.focused()
+            && strip.contains(focused)
+        {
+            commands.ensure_visible(focused);
+        }
     }
 }
 

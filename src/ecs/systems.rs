@@ -7,7 +7,7 @@ use bevy::ecs::query::{Added, Changed, Has, Or, With, Without};
 use bevy::ecs::system::{
     Commands, Local, NonSend, NonSendMut, Populated, Query, Res, ResMut, Single,
 };
-use bevy::math::IRect;
+use bevy::math::{IRect, IVec2, Vec2};
 use bevy::tasks::AsyncComputeTaskPool;
 use bevy::tasks::futures_lite::future;
 use bevy::time::Time;
@@ -25,7 +25,7 @@ use super::{
 
 use crate::config::{Config, decorations::BorderRadiusOption};
 use crate::ecs::display::FloatingLayer;
-use crate::ecs::layout::{Column, LayoutStrip};
+use crate::ecs::layout::{Column, LayoutStrip, StackItem};
 use crate::ecs::params::{ActiveDisplay, FrameActivity, Windows};
 use crate::ecs::{
     ActiveWorkspaceMarker, Bounds, BruteforceWindows, FlashMessage, FocusedMarker, Initializing,
@@ -38,9 +38,10 @@ use crate::manager::{
     Application, Display, Origin, Process, Size, Window, WindowManager, WindowOS,
     bruteforce_windows,
 };
-use crate::overlay::{FlashMessageManager, OverlayManager};
+use crate::overlay::{FlashMessageManager, OverlayManager, TabIndicatorGroup, TabIndicatorManager};
 use crate::platform::input::TapHealth;
 use crate::platform::{PlatformCallbacks, WinID};
+use crate::tab_indicator::TabIndicatorLayout;
 
 // Keep partially registered observers alive during slow AX startup.
 // A separate, low-frequency retry must not gate discovery of usable windows.
@@ -402,7 +403,7 @@ pub(crate) fn finish_setup(
         }
         debug!("space {}: after refresh {strip:?}", strip.id());
 
-        if active_strip && let Some(entity) = strip.first().ok().and_then(|column| column.top()) {
+        if active_strip && let Some(entity) = strip.first() {
             commands.focus_entity(entity, true);
             focused_managed_window = true;
         }
@@ -717,6 +718,30 @@ pub(super) fn retry_front_switch(
 /// scroll integrator's `MAX_STEP_SECS`) so the wakeup frame steps smoothly.
 const MAX_ANIMATION_STEP_SECS: f64 = 1.0 / 30.0;
 
+/// Keep fractional progress between OS pixel writes. Rounding the integrator's
+/// input every frame otherwise discards small steps and can stall indefinitely.
+#[derive(Default)]
+pub(super) struct AnimationProgress {
+    precise: Vec2,
+    written: IVec2,
+}
+
+impl AnimationProgress {
+    fn step(&mut self, current: IVec2, target: IVec2, t: f32, reset: bool) -> (IVec2, bool) {
+        if reset || self.written != current {
+            self.precise = current.as_vec2();
+        }
+        self.precise = self.precise.lerp(target.as_vec2(), t);
+        let finished = (target.as_vec2() - self.precise).length() <= ANIAMTE_SNAP_THRESHOLD;
+        self.written = if finished {
+            target
+        } else {
+            self.precise.round().as_ivec2()
+        };
+        (self.written, finished)
+    }
+}
+
 /// Animates window movement.
 /// Fraction of the remaining distance an exponential ease-out consumes in a
 /// frame, given a decay `rate` (per second) and the frame's `delta` in seconds.
@@ -744,38 +769,43 @@ fn ease_out_factor(rate: f64, delta: f64) -> f32 {
 /// * `commands` - Bevy commands to remove the `RepositionMarker` when animation is complete.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_entities(
-    animate: Populated<(&mut Position, Entity, &RepositionMarker)>,
+    animate: Populated<(
+        &mut Position,
+        Entity,
+        bevy::ecs::change_detection::Ref<RepositionMarker>,
+    )>,
     time: Res<Time>,
     config: Res<Config>,
     mut commands: Commands,
+    mut progress: Local<EntityHashMap<AnimationProgress>>,
 ) {
+    progress.retain(|entity, _| animate.contains(*entity));
     // Frame-rate-independent exponential smoothing (ease-out).
     // `animation_speed` is the decay rate (per second); higher = snappier.
     let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
 
     animate
         .into_iter()
-        .for_each(|(mut position, entity, RepositionMarker(origin))| {
-            let target = origin.as_vec2();
-            let current = position.0.as_vec2();
-            let lerped = current.lerp(target, t);
-
-            // Snap once we're within a pixel of the target (or after one effectively-
-            // complete tick), so the marker is dropped promptly.
-            let finished = (target - lerped).length() <= ANIAMTE_SNAP_THRESHOLD;
-            let new_pos = if finished {
-                *origin
-            } else {
-                lerped.round().as_ivec2()
-            };
+        .for_each(|(mut position, entity, marker)| {
+            let origin = &marker.0;
+            let (new_pos, finished) =
+                progress
+                    .entry(entity)
+                    .or_default()
+                    .step(position.0, *origin, t, marker.is_added());
 
             trace!(
                 "entity {entity} source {} dest {origin} t {t:.3} moving to {new_pos}",
                 position.0,
             );
-            position.0 = new_pos;
-            if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<RepositionMarker>();
+            if position.0 != new_pos {
+                position.0 = new_pos;
+            }
+            if finished {
+                progress.remove(&entity);
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_remove::<RepositionMarker>();
+                }
             }
         });
 }
@@ -792,35 +822,42 @@ pub(super) fn animate_entities(
 /// * `commands` - Bevy commands to remove the `ResizeMarker` when resizing is complete.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn animate_resize_entities(
-    animate: Populated<(&mut Bounds, Entity, &ResizeMarker)>,
+    animate: Populated<(
+        &mut Bounds,
+        Entity,
+        bevy::ecs::change_detection::Ref<ResizeMarker>,
+    )>,
     time: Res<Time>,
     config: Res<Config>,
     mut commands: Commands,
+    mut progress: Local<EntityHashMap<AnimationProgress>>,
 ) {
+    progress.retain(|entity, _| animate.contains(*entity));
     // Matches animate_entities: exponential ease-out, frame-rate independent.
     let t = ease_out_factor(config.animation_speed(), time.delta_secs_f64());
 
     animate
         .into_iter()
-        .for_each(|(mut bounds, entity, ResizeMarker(size))| {
-            let target = size.as_vec2();
-            let current = bounds.0.as_vec2();
-            let lerped = current.lerp(target, t);
-
-            let finished = (target - lerped).length() <= ANIAMTE_SNAP_THRESHOLD;
-            let new_size = if finished {
-                *size
-            } else {
-                lerped.round().as_ivec2()
-            };
+        .for_each(|(mut bounds, entity, marker)| {
+            let size = &marker.0;
+            let (new_size, finished) =
+                progress
+                    .entry(entity)
+                    .or_default()
+                    .step(bounds.0, *size, t, marker.is_added());
 
             trace!(
                 "entity {entity} source {} dest {size} t {t:.3} resizing to {new_size}",
                 bounds.0,
             );
-            bounds.0 = new_size;
-            if finished && let Ok(mut entity_commands) = commands.get_entity(entity) {
-                entity_commands.try_remove::<ResizeMarker>();
+            if bounds.0 != new_size {
+                bounds.0 = new_size;
+            }
+            if finished {
+                progress.remove(&entity);
+                if let Ok(mut entity_commands) = commands.get_entity(entity) {
+                    entity_commands.try_remove::<ResizeMarker>();
+                }
             }
         });
 }
@@ -962,12 +999,18 @@ pub(super) fn window_resized_update_frame(
         if resizing {
             continue;
         }
-        let Ok(new_frame) = window.update_frame() else {
-            continue;
-        };
         let active_strip = workspaces
             .iter_mut()
             .find(|(strip, _)| strip.contains(entity));
+        if active_strip
+            .as_ref()
+            .is_some_and(|(strip, _)| strip.is_parked_tab(entity))
+        {
+            continue;
+        }
+        let Ok(new_frame) = window.update_frame() else {
+            continue;
+        };
         let tabbed = active_strip
             .as_ref()
             .is_some_and(|strip| strip.0.tabbed(entity));
@@ -1264,6 +1307,107 @@ pub(super) fn update_overlays(
     );
 }
 
+/// Rebuilds the tab indicators, one per tabbed `Column::Stack` on each
+/// display's active workspace.
+pub(super) fn update_tab_indicators(
+    active_strips: Query<(Has<Scrolling>, &LayoutStrip, &ChildOf), With<ActiveWorkspaceMarker>>,
+    displays: Query<(&Display, Option<&crate::ecs::DockPosition>)>,
+    windows: Windows,
+    tab_indicator_mgr: Option<NonSendMut<TabIndicatorManager>>,
+    mission_control_active: Res<MissionControlActive>,
+    config: Res<Config>,
+) {
+    let Some(mut manager) = tab_indicator_mgr else {
+        return;
+    };
+
+    if !config.tab_indicator_enabled() || mission_control_active.0 {
+        manager.remove_all();
+        return;
+    }
+
+    let layout = TabIndicatorLayout {
+        position: config.tab_indicator_position(),
+        #[allow(clippy::cast_possible_truncation)]
+        width: config.tab_indicator_width() as i32,
+        #[allow(clippy::cast_possible_truncation)]
+        gap: config.tab_indicator_gap() as i32,
+        #[allow(clippy::cast_possible_truncation)]
+        segment_gap: config.tab_indicator_segment_gap() as i32,
+    };
+
+    let sliver_width = config.sliver_width();
+    let mut groups = Vec::new();
+    for (swiping, strip, child_of) in &active_strips {
+        if swiping || !strip.has_tabbed_stacks() || strip.is_fullscreen() {
+            continue;
+        }
+        let Ok((display, dock)) = displays.get(child_of.parent()) else {
+            continue;
+        };
+        let viewport = display.actual_display_bounds(dock, &config);
+        for column in strip.columns() {
+            let Column::Stack(items) = column else {
+                continue;
+            };
+            let Some(first) = column.top() else {
+                continue;
+            };
+            let Some(active_entity) = strip.active_tab(first) else {
+                continue;
+            };
+            let Some(active_window) = windows.get(active_entity) else {
+                continue;
+            };
+
+            // `Window::frame()` includes padding; strip it as `update_overlays`
+            // does, or the indicator drifts toward the neighboring column.
+            let frame = active_window.frame();
+            let h_pad = active_window.horizontal_padding();
+            let v_pad = active_window.vertical_padding();
+            let column_rect = IRect::from_corners(
+                frame.min + Origin::new(h_pad, v_pad),
+                frame.max - Origin::new(h_pad, v_pad),
+            );
+
+            // Skip columns scrolled out of the viewport (beyond the
+            // off-screen sliver).
+            if !crate::tab_indicator::column_is_visible(column_rect, viewport, sliver_width) {
+                continue;
+            }
+
+            let mut active_index = None;
+            let mut window_ids = Vec::with_capacity(items.len());
+            for (idx, entity) in items.iter().flat_map(StackItem::window_iter).enumerate() {
+                let Some(window) = windows.get(entity) else {
+                    window_ids.clear();
+                    break;
+                };
+                if entity == active_entity {
+                    active_index = Some(idx);
+                }
+                window_ids.push(window.id());
+            }
+            let Some(active_index) = active_index.filter(|_| window_ids.len() >= 2) else {
+                continue;
+            };
+
+            groups.push(TabIndicatorGroup {
+                column_rect,
+                window_ids,
+                active_index,
+            });
+        }
+    }
+
+    manager.update(
+        &groups,
+        &layout,
+        config.tab_indicator_active_color(),
+        config.tab_indicator_inactive_color(),
+    );
+}
+
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn commit_window_position(
     mut moved_windows: Populated<(&mut Window, &Position), Changed<Position>>,
@@ -1352,6 +1496,7 @@ pub(crate) fn cleanup_on_exit(
     displays: Query<&Display>,
     window_manager: Res<WindowManager>,
     mut overlay_mgr: Option<NonSendMut<OverlayManager>>,
+    mut tab_indicator_mgr: Option<NonSendMut<TabIndicatorManager>>,
 ) {
     for _ in exit_events.read() {
         let ids = all_windows
@@ -1363,6 +1508,9 @@ pub(crate) fn cleanup_on_exit(
 
         if let Some(ref mut overlay_mgr) = overlay_mgr {
             overlay_mgr.remove_all();
+        }
+        if let Some(ref mut tab_indicator_mgr) = tab_indicator_mgr {
+            tab_indicator_mgr.remove_all();
         }
 
         let display_bounds = displays.iter().map(Display::bounds).collect::<Vec<_>>();
@@ -1953,5 +2101,55 @@ mod pump_timeout_tests {
                 assert!(timeout <= idle, "waiting {timeout} ms after {idle} ms idle");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod animation_tests {
+    use super::{AnimationProgress, ease_out_factor};
+    use bevy::math::IVec2;
+
+    #[test]
+    fn subpixel_steps_accumulate_and_finish_even_at_short_event_intervals() {
+        // The old rounded recurrence stopped 31 pixels short at this rate.
+        for delta in [0.001, 1.0 / 60.0, 1.0 / 120.0] {
+            let mut progress = AnimationProgress::default();
+            let mut current = IVec2::new(100, 200);
+            let target = IVec2::new(140, 220);
+            let mut finished = false;
+            let mut elapsed = 0.0;
+            while elapsed < 1.0 && !finished {
+                (current, finished) = progress.step(
+                    current,
+                    target,
+                    ease_out_factor(16.0, delta),
+                    elapsed == 0.0,
+                );
+                elapsed += delta;
+            }
+            assert!(finished, "animation stalled with delta {delta}");
+            assert_eq!(current, target);
+        }
+    }
+
+    #[test]
+    fn fractional_progress_does_not_override_external_moves_or_new_animations() {
+        let mut progress = AnimationProgress::default();
+        progress.step(IVec2::ZERO, IVec2::splat(100), 0.25, true);
+        assert_eq!(
+            progress
+                .step(IVec2::splat(200), IVec2::splat(300), 0.5, false)
+                .0,
+            IVec2::splat(250),
+        );
+        // A marker removed and re-added starts at the written pixel, even
+        // when it happens to equal the preceding animation's last write.
+        progress.step(IVec2::ZERO, IVec2::splat(100), 0.254, true);
+        assert_eq!(
+            progress
+                .step(IVec2::splat(25), IVec2::splat(100), 0.0, true)
+                .0,
+            IVec2::splat(25),
+        );
     }
 }

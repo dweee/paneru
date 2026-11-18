@@ -459,6 +459,11 @@ pub(super) fn mission_control_trigger(
                         .filter_map(|entity| windows.get(entity).zip(Some(entity)))
                         .filter(|(window, _)| !present_windows.contains(&window.id()));
                     for (window, entity) in moved_windows {
+                        // A parked tab's off-screen position can look like
+                        // a move to another display; ignore it.
+                        if active_strip.is_parked_tab(entity) {
+                            continue;
+                        }
                         debug!(
                             "window {} {entity} moved, removing from workspace {}",
                             window.id(),
@@ -517,7 +522,7 @@ pub(super) fn application_event_trigger(
     };
 
     for event in messages.read() {
-        match event {
+        match &event {
             Event::ApplicationLaunched { psn, observer } => {
                 if let Some((BProcess(process), entity)) = find_process(*psn) {
                     // Readiness KVO uses the same message as the initial launch.
@@ -578,7 +583,7 @@ pub(super) fn dispatch_application_messages(
     let find_window = |window_id| windows.find(window_id);
 
     for event in messages.read() {
-        match event {
+        match &event {
             Event::WindowMinimized { window_id } => {
                 if let Some((_, entity)) = find_window(*window_id)
                     && let Ok(mut entity_commands) = commands.get_entity(entity)
@@ -636,7 +641,7 @@ pub(super) fn dispatch_application_messages(
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn window_unmanaged_trigger(
-    trigger: On<Add, Unmanaged>,
+    trigger: On<Add<Unmanaged>>,
     apps: Query<(Entity, &Application)>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     // `Option<Single>` rather than `Single`: an unresolvable display would skip the
@@ -774,7 +779,7 @@ fn remember_managed_strip(entity: Entity, strip: &LayoutStrip, commands: &mut Co
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn window_minimized_trigger(
-    trigger: On<Add, Unmanaged>,
+    trigger: On<Add<Unmanaged>>,
     windows: Windows,
     workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     active_display: Single<&Display, With<ActiveDisplayMarker>>,
@@ -815,7 +820,7 @@ pub(super) fn window_minimized_trigger(
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn window_managed_trigger(
-    trigger: On<Remove, Unmanaged>,
+    trigger: On<Remove<Unmanaged>>,
     active_display: Single<(&Display, Option<&DockPosition>), With<ActiveDisplayMarker>>,
     apps: Query<(Entity, &Application)>,
     mut workspaces: Query<
@@ -981,7 +986,7 @@ pub(super) fn window_destroyed_trigger(
     mut commands: Commands,
 ) {
     for event in messages.read() {
-        let Event::WindowDestroyed { window_id, source } = event else {
+        let Event::WindowDestroyed { window_id, source } = &event else {
             continue;
         };
 
@@ -1038,7 +1043,7 @@ pub(super) fn window_destroyed_trigger(
 /// subscriber sees the new title in the same frame it changed.
 pub(super) fn invalidate_window_title(mut messages: MessageReader<Event>, windows: Windows) {
     for event in messages.read() {
-        let Event::WindowTitleChanged { window_id } = event else {
+        let Event::WindowTitleChanged { window_id } = &event else {
             continue;
         };
         if let Some((window, _)) = windows.find(*window_id) {
@@ -1577,7 +1582,7 @@ pub(super) fn refresh_configuration_trigger(
 }
 
 pub(super) fn window_removal_trigger(
-    trigger: On<Remove, Window>,
+    trigger: On<Remove<Window>>,
     mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
     windows: Windows,
     global_state: GlobalState,
@@ -1618,7 +1623,7 @@ pub(super) fn send_message_trigger(
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn cleanup_timeout_trigger(
-    trigger: On<Remove, Timeout>,
+    trigger: On<Remove<Timeout>>,
     all_timeouts: Query<&Timeout>,
     mut commands: Commands,
 ) {
@@ -1673,7 +1678,7 @@ type RefusedResizes<'w, 's> = Populated<
 /// earlier one waits on the app, with the window still in place, keeps the
 /// earlier center.
 pub(super) fn record_resize_anchor(
-    trigger: On<Insert, ResizeMarker>,
+    trigger: On<Insert<ResizeMarker>>,
     windows: UnanchoredWindows,
     mut commands: Commands,
 ) {

@@ -1757,11 +1757,7 @@ fn active_strip_first_id(world: &mut World) -> i32 {
     let entity = {
         let mut q = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
         let strip = q.single(world).expect("a single active strip");
-        strip
-            .first()
-            .expect("strip should have a column")
-            .top()
-            .expect("column should have a top entity")
+        strip.first().expect("strip should have a column")
     };
     entity_to_window_id(world, entity)
 }
@@ -1770,11 +1766,7 @@ fn active_strip_last_id(world: &mut World) -> i32 {
     let entity = {
         let mut q = world.query_filtered::<&LayoutStrip, With<ActiveWorkspaceMarker>>();
         let strip = q.single(world).expect("a single active strip");
-        strip
-            .last()
-            .expect("strip should have a column")
-            .top()
-            .expect("column should have a top entity")
+        strip.last().expect("strip should have a column")
     };
     entity_to_window_id(world, entity)
 }
@@ -5056,5 +5048,81 @@ fn test_exit_mid_animation_keeps_the_restored_frames() {
             "window {} must stay centered on the display after exit, got {frame:?}",
             window.id()
         );
+    }
+}
+
+/// AX move echoes can wake the event loop much faster than the display period.
+/// Rounded per-frame feedback used to leave reposition markers stuck forever.
+#[test]
+fn test_focus_animation_finishes_with_one_millisecond_event_intervals() {
+    let config: Config = (
+        MainOptions {
+            animation_speed: Some(16.0),
+            ..Default::default()
+        },
+        vec![],
+    )
+        .into();
+    let mut harness = TestHarness::new().with_config(config).with_windows(3);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    harness
+        .app
+        .insert_resource(bevy::time::TimeUpdateStrategy::ManualDuration(
+            std::time::Duration::from_millis(1),
+        ));
+    harness.app.world_mut().write_message(Event::Command {
+        command: Command::Window(Operation::Focus(Direction::Last)),
+    });
+    harness.app.update();
+    assert!(
+        harness
+            .world()
+            .query::<&RepositionMarker>()
+            .iter(harness.world())
+            .next()
+            .is_some()
+    );
+    for _ in 0..1000 {
+        harness.app.update();
+    }
+    let world = harness.world();
+    assert_eq!(world.query::<&RepositionMarker>().iter(world).count(), 0);
+    assert_focused!(world, 2);
+}
+
+/// A wakeup must update the clock in the same frame: alternating long and
+/// short pump intervals must not feed the preceding interval to animation.
+#[test]
+fn test_clock_samples_the_current_event_pump_interval() {
+    use bevy::app::First;
+    use bevy::ecs::schedule::IntoScheduleConfigs;
+    use bevy::ecs::system::{Local, ResMut};
+    use bevy::time::{Real, Time, TimeUpdateStrategy};
+
+    let mut harness = TestHarness::new().with_windows(1);
+    harness.run(vec![Event::MenuOpened { window_id: 0 }]);
+    let start = harness
+        .world()
+        .resource::<Time<Real>>()
+        .last_update()
+        .expect("clock initialized by warm-up");
+    // Simulate the time observed when a blocking pump returns. Updating the
+    // manual clock strategy in the pump phase avoids wall-clock sleeps.
+    let intervals = [Duration::from_millis(200), Duration::from_millis(4)];
+    harness.app.add_systems(
+        First,
+        (move |mut strategy: ResMut<TimeUpdateStrategy>, mut step: Local<usize>| {
+            let elapsed: Duration = intervals[..=*step].iter().sum();
+            *strategy = TimeUpdateStrategy::ManualInstant(start + elapsed);
+            *step += 1;
+        })
+        .in_set(crate::ecs::FirstSet::Pump)
+        .after(crate::ecs::systems::pump_events),
+    );
+    for interval in intervals {
+        harness.app.update();
+        let world = harness.world();
+        assert_eq!(world.resource::<Time<Real>>().delta(), interval);
+        assert_eq!(world.resource::<Time>().delta(), interval);
     }
 }

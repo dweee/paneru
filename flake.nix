@@ -4,8 +4,8 @@
   inputs = {
     flake-parts.url = "github:hercules-ci/flake-parts/ea2630b7470978622c7689a1ff75d2b389175399";
     import-tree.url = "github:vic/import-tree/eb1b52eaecc57f7c136d07ae8a93e724dfecac46";
-    nixpkgs.url = "github:nixos/nixpkgs/f4a03c008967841f2a0b3cb7c436fc6fc31671f6";
-    crane.url = "github:ipetkov/crane/79fd63528501446749c09f08cad486a58c7d173e";
+    nixpkgs.url = "github:nixos/nixpkgs/0bb8272318b4ca41bf0edc6224df3e3e3046b70d";
+    crane.url = "github:ipetkov/crane/95e62def851e9d650f0eab63cb4f59a3306e20bd";
     nix-darwin = {
       url = "github:nix-darwin/nix-darwin/ff0e21a414d4547183396da1b44a66f2577b65e9";
       inputs.nixpkgs.follows = "nixpkgs";

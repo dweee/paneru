@@ -21,6 +21,7 @@ use self::decorations::{
     BorderRadiusOption, DescriptorStyle, IndicatorFormat, IndicatorStyle, MenubarOrientation,
 };
 use self::swipe::SwipeGestureDirection;
+use crate::tab_indicator::TabIndicatorPosition;
 
 #[cfg(test)]
 use crate::commands::{MoveFocus, Operation, ResizeDirection};
@@ -723,6 +724,72 @@ impl Config {
         self.options().menubar_height.map(i32::from)
     }
 
+    pub fn tab_indicator_enabled(&self) -> bool {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.tab_indicator.as_ref())
+            .and_then(|tab_indicator| tab_indicator.enabled)
+            .unwrap_or(true)
+    }
+
+    pub fn tab_indicator_position(&self) -> TabIndicatorPosition {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.tab_indicator.as_ref())
+            .and_then(|tab_indicator| tab_indicator.position)
+            .unwrap_or_default()
+    }
+
+    pub fn tab_indicator_width(&self) -> f64 {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.tab_indicator.as_ref())
+            .and_then(|tab_indicator| tab_indicator.width)
+            .unwrap_or(6.0)
+            .max(0.0)
+    }
+
+    pub fn tab_indicator_gap(&self) -> f64 {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.tab_indicator.as_ref())
+            .and_then(|tab_indicator| tab_indicator.gap)
+            .unwrap_or(4.0)
+            .max(0.0)
+    }
+
+    pub fn tab_indicator_segment_gap(&self) -> f64 {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.tab_indicator.as_ref())
+            .and_then(|tab_indicator| tab_indicator.segment_gap)
+            .unwrap_or(2.0)
+            .max(0.0)
+    }
+
+    pub fn tab_indicator_active_color(&self) -> (f64, f64, f64) {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.tab_indicator.as_ref())
+            .and_then(|tab_indicator| tab_indicator.active_color.as_deref())
+            .map_or((0.353, 0.784, 0.980), parse_hex_color)
+    }
+
+    pub fn tab_indicator_inactive_color(&self) -> (f64, f64, f64) {
+        self.inner()
+            .decorations
+            .as_ref()
+            .and_then(|decorations| decorations.tab_indicator.as_ref())
+            .and_then(|tab_indicator| tab_indicator.inactive_color.as_deref())
+            .map_or((0.4, 0.4, 0.4), parse_hex_color)
+    }
+
     pub fn swipe_sensitivity(&self) -> f64 {
         let config = self.inner();
         config
@@ -876,6 +943,18 @@ impl Config {
 
     pub fn horizontal_mouse_warp_offset(&self) -> i32 {
         self.options().horizontal_mouse_warp_offset.unwrap_or(0)
+    }
+
+    pub fn horizontal_mouse_warp_lowest_below(&self) -> bool {
+        self.options()
+            .horizontal_mouse_warp_lowest_below
+            .is_some_and(|below| below)
+    }
+
+    pub fn remember_display_setups(&self) -> bool {
+        self.options()
+            .remember_display_setups
+            .is_some_and(|remember| remember)
     }
 
     pub fn reap_empty_workspaces(&self) -> bool {
@@ -1266,6 +1345,8 @@ pub struct MainOptions {
     /// higher or lower than the laptop). When warping downward (target below
     /// source) the offset is added; when warping upward, subtracted.
     pub horizontal_mouse_warp_offset: Option<i32>,
+    /// Puts the lowest display below the warp row instead of in it.
+    pub horizontal_mouse_warp_lowest_below: Option<bool>,
     /// A list of preset column widths (as ratios) used for resizing windows.
     #[serde(default = "default_preset_column_widths")]
     pub preset_column_widths: Vec<f64>,
@@ -1330,6 +1411,10 @@ pub struct MainOptions {
     /// If enabled, an empty virtual workspace will be removed.
     /// Default: true.
     pub reap_empty_workspaces: Option<bool>,
+
+    /// Remembers the layout of each display setup and restores it when that setup returns.
+    /// Default: false.
+    pub remember_display_setups: Option<bool>,
 
     /// Disable detection of native macOS tabs. When set, newly-spawned windows are
     /// never auto-merged into a tab group with an existing same-app sibling.

@@ -134,8 +134,12 @@ impl StateBroadcastIntent {
                         Command::Window(
                             Operation::VirtualMove(_, _)
                             | Operation::VirtualMoveNumber(_, _)
+                            | Operation::ToNextDisplay(_)
+                            | Operation::ToDisplay(..)
                             | Operation::Swap(_)
                             | Operation::Stack(_)
+                            | Operation::Consume
+                            | Operation::Expel
                             | Operation::ToggleTabbedDisplay,
                         ),
                 } => intent.windows_changed = true,

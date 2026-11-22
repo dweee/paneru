@@ -45,8 +45,11 @@ use skylight::{
     SLSWindowIteratorGetTags, SLSWindowIteratorGetWindowID, SLSWindowQueryResultCopyWindows,
     SLSWindowQueryWindows,
 };
-pub(crate) use windows::forget_enhanced_ui_state;
 pub use windows::{Window, WindowApi, WindowOS, WindowPadding, ax_window_id, try_ax_window_id};
+pub(crate) use windows::{
+    enhanced_ui_restore_pending, forget_enhanced_ui_state, next_enhanced_ui_restore_timeout_ms,
+    restore_deferred_enhanced_ui,
+};
 
 #[cfg(test)]
 pub use process::MockProcessApi;

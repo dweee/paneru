@@ -7,7 +7,7 @@
     nixpkgs.url = "github:nixos/nixpkgs/2786a2a72088ecf32aea5b3ec52099e6a7cff78f";
     crane.url = "github:ipetkov/crane/95e62def851e9d650f0eab63cb4f59a3306e20bd";
     nix-darwin = {
-      url = "github:nix-darwin/nix-darwin/f673885103fa92c1c5b1d16b8bf2b858906809e2";
+      url = "github:nix-darwin/nix-darwin/663d8b962a11cda261b6e9f14e03911fac94baf0";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };

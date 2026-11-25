@@ -35,7 +35,7 @@ use crate::ecs::{
 };
 use crate::events::{Event, InputEvent, OverviewEvent};
 use crate::manager::{
-    Application, Display, Origin, Process, Size, Window, WindowManager, WindowOS,
+    Application, Display, Origin, Process, ProcessApi, Size, Window, WindowManager, WindowOS,
     bruteforce_windows,
 };
 use crate::overlay::{FlashMessageManager, OverlayManager, TabIndicatorGroup, TabIndicatorManager};
@@ -427,6 +427,19 @@ pub(crate) fn finish_setup(
     commands.trigger(RestoreWindowState);
 }
 
+fn check_force_manage(config: &Config, process: &mut dyn ProcessApi) -> bool {
+    if config.should_force_manage_process(process) {
+        debug!(
+            "Forcing management of launched process '{}' despite unobservable policy.",
+            process.name()
+        );
+        process.force_manage(true);
+        true
+    } else {
+        false
+    }
+}
+
 /// Handles the event when a new application is launched. It creates a `Process` and `Application` object,
 /// observes the application for events, and adds its windows to the manager.
 /// This system processes `BProcess` entities marked with `FreshMarker`.
@@ -454,16 +467,16 @@ pub(super) fn add_launched_process(
             continue;
         }
 
-        if config.should_force_manage_process(process) {
-            debug!(
-                "Forcing management of launched process '{}' despite unobservable policy.",
-                process.name()
-            );
-            process.force_manage(true);
-        }
-
+        let forced = check_force_manage(&config, process);
         if !process.ready() {
-            continue;
+            // `ready()` may have just resolved `NSRunningApplication` for a
+            // process that lacked one at launch, making its bundle ID available
+            // for `manage = true` rules. Re-check once and retry readiness so
+            // force-managed accessory apps are adopted immediately without
+            // leaving an activationPolicy KVO observer behind.
+            if forced || !check_force_manage(&config, process) || !process.ready() {
+                continue;
+            }
         }
 
         if children {
@@ -991,6 +1004,7 @@ pub(crate) fn pump_events(
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn window_resized_update_frame(
     mut messages: MessageReader<Event>,
+    drag: Res<crate::ecs::drag::WindowDrag>,
     mut windows: ResizableWindows,
     mut workspaces: Query<(&LayoutStrip, &mut Position)>,
 ) {
@@ -1012,7 +1026,7 @@ pub(super) fn window_resized_update_frame(
         // and `animate_resize_entities` is still stepping toward it, so reading
         // the echo in here would fight the animation producing that difference.
         // Only a resize we did not initiate is new information.
-        if resizing {
+        if resizing || drag.holds(entity) {
             continue;
         }
         let active_strip = workspaces
@@ -1215,6 +1229,7 @@ pub(super) fn update_overlays(
     windows: Windows,
     applications: Query<&Application>,
     overlay_mgr: Option<NonSendMut<OverlayManager>>,
+    drag: Option<Res<crate::ecs::drag::WindowDrag>>,
     mission_control_active: Res<MissionControlActive>,
     config: Res<Config>,
     theme: Option<Res<SystemTheme>>,
@@ -1231,13 +1246,17 @@ pub(super) fn update_overlays(
     let dim_opacity = config.dim_inactive_opacity();
     let border_enabled = config.border_active_window();
 
-    // Hide overlays during swipe, mission control, native fullscreen spaces,
-    // or briefly after a space change (macOS space-switch animation).
+    // Hide overlays during swipe, title-bar drag, mission control, native
+    // fullscreen spaces, or briefly after a space change (macOS space-switch animation).
     let Some((swiping, active_strip)) = active_workspace.iter().next() else {
         return;
     };
 
-    if swiping || mission_control_active.0 || active_strip.is_fullscreen() {
+    if swiping
+        || drag.is_some_and(|drag| drag.dragging())
+        || mission_control_active.0
+        || active_strip.is_fullscreen()
+    {
         overlay_mgr.hide_all();
         return;
     }
@@ -1426,14 +1445,17 @@ pub(super) fn update_tab_indicators(
 
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn commit_window_position(
-    mut moved_windows: Populated<(&mut Window, &Position), Changed<Position>>,
+    drag: Res<crate::ecs::drag::WindowDrag>,
+    mut moved_windows: Populated<(Entity, &mut Window, &Position), Changed<Position>>,
 ) {
     // `par_iter_mut` runs on `ComputeTaskPool` worker threads, which have no
     // `CFRunLoop` of their own to drain thread-local autorelease pools.
     moved_windows
         .par_iter_mut()
-        .for_each(|(mut window, position)| {
-            objc2::rc::autoreleasepool(|_| window.reposition(position.0));
+        .for_each(|(entity, mut window, position)| {
+            if !drag.holds(entity) {
+                objc2::rc::autoreleasepool(|_| window.reposition(position.0));
+            }
         });
 }
 
@@ -1469,6 +1491,7 @@ pub(super) fn verify_window_position(
 /// display.
 #[instrument(level = Level::TRACE, skip_all)]
 pub(super) fn commit_window_size(
+    drag: Res<crate::ecs::drag::WindowDrag>,
     active_display: ActiveDisplay,
     strips: Query<(&LayoutStrip, &ChildOf)>,
     displays: Query<&Display>,
@@ -1492,6 +1515,9 @@ pub(super) fn commit_window_size(
     resized_windows
         .par_iter_mut()
         .for_each(|(entity, mut window, size, mut width_ratio)| {
+            if drag.holds(entity) {
+                return;
+            }
             let width = widths.get(&entity).copied().unwrap_or(fallback);
             width_ratio.0 = f64::from(size.0.x) / f64::from(width);
             objc2::rc::autoreleasepool(|_| window.resize(size.0));

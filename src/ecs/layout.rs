@@ -3,7 +3,7 @@ use bevy::ecs::change_detection::DetectChangesMut;
 use bevy::ecs::component::Component;
 use bevy::ecs::entity::{Entity, EntityHashMap, EntityHashSet};
 use bevy::ecs::hierarchy::ChildOf;
-use bevy::ecs::query::{Changed, Has, Or, With, Without};
+use bevy::ecs::query::{Changed, Has, Or, QueryData, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
 use bevy::ecs::system::{Commands, ParamSet, Populated, Query, Res};
@@ -16,9 +16,9 @@ use crate::config::Config;
 use crate::ecs::params::Windows;
 use crate::ecs::workspace::{PreviousStripPosition, SnapStripMarker};
 use crate::ecs::{
-    Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition, ManualStripOffset,
-    ParkedTabMarker, Position, RepositionMarker, ReshuffleAroundMarker, ResizeAnchor, ResizeMarker,
-    Scrolling, SpawnCommandsExt,
+    ActiveWorkspaceMarker, Bounds, DockPosition, EnsureVisibleMarker, Initializing, LayoutPosition,
+    ManualStripOffset, ParkedTabMarker, Position, RepositionMarker, ReshuffleAroundMarker,
+    ResizeAnchor, ResizeMarker, Scrolling, SpawnCommandsExt,
 };
 use crate::errors::{Error, Result};
 use crate::manager::{Display, Origin, Size, Window};
@@ -56,7 +56,28 @@ type StripPlacements<'w, 's> = Query<
 
 /// Displays paired with the Dock's current edge, which is what turns a display's
 /// raw bounds into the usable viewport.
-type DisplayViewports<'w, 's> = Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>;
+pub(crate) type DisplayViewports<'w, 's> =
+    Query<'w, 's, (&'static Display, Option<&'static DockPosition>)>;
+
+/// Query data for removing windows from a [`LayoutStrip`] while keeping the
+/// focused window stationary on screen when a column to its left disappears.
+#[derive(QueryData)]
+#[query_data(mutable)]
+pub(crate) struct RemovableStrip {
+    pub(crate) entity: Entity,
+    pub(crate) strip: &'static mut LayoutStrip,
+    pub(crate) position: &'static mut Position,
+    pub(crate) reposition: Option<&'static mut RepositionMarker>,
+    pub(crate) scrolling: Option<&'static mut Scrolling>,
+    pub(crate) child_of: Option<&'static ChildOf>,
+    pub(crate) active: Has<ActiveWorkspaceMarker>,
+    pub(crate) has_previous_position: Has<PreviousStripPosition>,
+    pub(crate) has_manual_offset: Has<ManualStripOffset>,
+}
+
+/// Every strip with the placement state needed to compensate its origin after
+/// removing a column left of focus.
+pub(crate) type RemovableStrips<'w, 's> = Query<'w, 's, RemovableStrip, Without<Window>>;
 
 /// A strip, its entity, its own scroll position (and any in-flight target),
 /// whether it's mid-swipe, and its parent display. Used by
@@ -175,6 +196,125 @@ pub(crate) fn origin_exposing(
     viewport: IRect,
 ) -> Origin {
     clamp_origin_to_viewport(layout + origin, size, viewport) - layout
+}
+
+/// Computes the adjusted strip `x` after removing a column of `removed_width`
+/// strictly left of the focused column.
+///
+/// When `clamp_left` is `true` (neither `auto_center` nor `ManualStripOffset`
+/// is active), the result is capped at `viewport_min_x.max(origin_x)` so
+/// off-screen columns to the left slide in to fill the gap without opening a
+/// new blank gap on the left edge (while never yanking leftward if the strip
+/// was already scrolled past `viewport_min_x` via continuous swipe).
+#[must_use]
+pub(crate) fn shift_origin_after_left_removal(
+    origin_x: i32,
+    removed_width: i32,
+    viewport_min_x: i32,
+    clamp_left: bool,
+) -> i32 {
+    let shifted = origin_x.saturating_add(removed_width);
+    if clamp_left {
+        shifted.min(viewport_min_x.max(origin_x))
+    } else {
+        shifted
+    }
+}
+
+/// Removes `entity` from `strip`, returning the removed column's width when
+/// removing `entity` dropped a whole column strictly to the left of `focused`.
+pub(crate) fn remove_left_column_width(
+    strip: &mut LayoutStrip,
+    entity: Entity,
+    focused: Option<Entity>,
+    windows: &Windows,
+) -> Option<i32> {
+    let left_width = focused.and_then(|focused| {
+        let removed_idx = strip.index_of(entity).ok()?;
+        let focused_idx = strip.index_of(focused).ok()?;
+        if removed_idx >= focused_idx {
+            return None;
+        }
+        strip
+            .get(removed_idx)
+            .ok()?
+            .window_iter()
+            .filter_map(|member| windows.moving_frame(member))
+            .map(|frame| frame.width())
+            .max()
+            .filter(|&width| width > 0)
+    });
+    let len_before = strip.len();
+    strip.remove(entity);
+    (strip.len() < len_before).then_some(left_width).flatten()
+}
+
+/// Shifts an active strip's origin (and any in-flight reposition/scroll state)
+/// rightward by `removed_width` so windows at or right of the focused column
+/// stay at the same screen `x`.
+pub(crate) fn compensate_left_removal(
+    removed_width: i32,
+    position: &mut Position,
+    reposition: Option<&mut RepositionMarker>,
+    scrolling: Option<&mut Scrolling>,
+    has_manual_offset: bool,
+    viewport_min_x: i32,
+    config: &Config,
+) {
+    let clamp_left = !config.auto_center() && !has_manual_offset;
+    position.0.x =
+        shift_origin_after_left_removal(position.0.x, removed_width, viewport_min_x, clamp_left);
+    if let Some(reposition) = reposition {
+        reposition.0.x = shift_origin_after_left_removal(
+            reposition.0.x,
+            removed_width,
+            viewport_min_x,
+            clamp_left,
+        );
+    }
+    if let Some(scrolling) = scrolling {
+        let shifted = scrolling.position + f64::from(removed_width);
+        scrolling.position = if clamp_left {
+            shifted.min(f64::from(viewport_min_x).max(scrolling.position))
+        } else {
+            shifted
+        };
+    }
+}
+
+impl RemovableStripItem<'_, '_> {
+    /// Removes `entity` from this strip, shifting the strip's origin when a
+    /// whole column left of `focused` disappears from an active, non-parked
+    /// strip so the focused window stays at the same screen `x`.
+    pub(crate) fn remove_preserving_focus(
+        &mut self,
+        entity: Entity,
+        focused: Option<Entity>,
+        windows: &Windows,
+        displays: &DisplayViewports,
+        config: &Config,
+    ) {
+        let effective_focused = (self.active && !self.has_previous_position)
+            .then_some(focused)
+            .flatten();
+        if let Some(removed_width) =
+            remove_left_column_width(&mut self.strip, entity, effective_focused, windows)
+            && let Some(viewport_min_x) = self
+                .child_of
+                .and_then(|parent| displays.get(parent.parent()).ok())
+                .map(|(display, dock)| display.actual_display_bounds(dock, config).min.x)
+        {
+            compensate_left_removal(
+                removed_width,
+                &mut self.position,
+                self.reposition.as_deref_mut(),
+                self.scrolling.as_deref_mut(),
+                self.has_manual_offset,
+                viewport_min_x,
+                config,
+            );
+        }
+    }
 }
 
 impl Plugin for LayoutEventsPlugin {
@@ -411,6 +551,40 @@ pub struct LayoutStrip {
 }
 
 impl LayoutStrip {
+    /// Move a column within this strip, preserving its stack and active tab.
+    pub(crate) fn move_column(&mut self, from: usize, to: usize) {
+        if from != to
+            && to < self.columns.len()
+            && let Some(column) = self.columns.remove(from)
+        {
+            self.columns.insert(to, column);
+        }
+    }
+
+    /// Move a whole column and its active-tab mapping between strips.
+    pub(crate) fn transfer_column(&mut self, to: &mut Self, from: usize, slot: usize) -> bool {
+        let Some(column) = self.columns.get(from) else {
+            return false;
+        };
+        if self.is_fullscreen()
+            || to.is_fullscreen()
+            || slot > to.len()
+            || column.window_iter().any(|entity| to.contains(entity))
+        {
+            return false;
+        }
+        let Some(column) = self.columns.remove(from) else {
+            return false;
+        };
+        for entity in column.window_iter() {
+            if let Some(active) = self.tabbed_stacks.remove(&entity) {
+                to.tabbed_stacks.insert(entity, active);
+            }
+        }
+        to.columns.insert(slot, column);
+        true
+    }
+
     pub fn new(id: WorkspaceId, virtual_index: u32) -> Self {
         Self {
             id,
@@ -1012,8 +1186,23 @@ impl LayoutStrip {
         self.id
     }
 
-    pub fn columns(&self) -> impl Iterator<Item = &Column> {
+    pub fn columns(&self) -> impl DoubleEndedIterator<Item = &Column> {
         self.columns.iter()
+    }
+
+    /// Resolves a value for `column` by preferring its landing entity (the
+    /// active tab for a tabbed-display stack, otherwise `top()`), falling back
+    /// to the first member in `column` for which `resolve` returns `Some`.
+    pub fn resolve_column<T>(
+        &self,
+        column: &Column,
+        mut resolve: impl FnMut(Entity) -> Option<T>,
+    ) -> Option<T> {
+        column
+            .top()
+            .map(|entity| self.landing_entity(entity))
+            .and_then(&mut resolve)
+            .or_else(|| column.window_iter().find_map(resolve))
     }
 
     #[instrument(level = Level::TRACE, skip_all, fields(layout_strip_height))]
@@ -1686,18 +1875,19 @@ pub(super) fn reshuffle_layout_strip(
         // Enforce the edge invariant when auto-center is off: the leftmost
         // window must touch the left edge and the rightmost the right edge
         // if more than 1 windows in workspace.
+        let column_right_edge = |entity| {
+            windows
+                .layout_position(entity)
+                .zip(windows.moving_frame(entity))
+                .map(|(position, frame)| position.0.x + frame.width())
+        };
         if !config.auto_center()
             && !config.continuous_swipe()
             && let Some(total_strip_width) = ctx
                 .strip
-                .last()
-                .and_then(|last| {
-                    windows
-                        .layout_position(last)
-                        .map(|position| position.0.x)
-                        .zip(windows.moving_frame(last).map(|frame| frame.width()))
-                })
-                .map(|(last_x, last_width)| last_x + last_width)
+                .columns()
+                .rev()
+                .find_map(|column| ctx.strip.resolve_column(column, column_right_edge))
         {
             strip_position.x = if display_bounds.width() < total_strip_width {
                 strip_position.x.clamp(
@@ -1885,6 +2075,7 @@ fn insert_strip_window_contexts(
 /// the layout strip against the current display viewport.
 #[instrument(level = Level::DEBUG, skip_all)]
 fn position_layout_windows(
+    drag: Res<crate::ecs::drag::WindowDrag>,
     positioned_windows: RepositionedWindows,
     workspaces: StripsForWindowPositioning,
     snap_guards: Query<&SnapStripMarker>,
@@ -1913,6 +2104,9 @@ fn position_layout_windows(
     for (entity, window, layout_position, mut position, mut bounds, resize, was_parked_tab) in
         positioned_windows
     {
+        if drag.holds(entity) {
+            continue;
+        }
         let Some(context) = strip_contexts.get(&entity) else {
             continue;
         };
@@ -3444,5 +3638,76 @@ mod tests {
         }
         assert_eq!(strip.right_neighbour(leader), Some(b));
         assert_eq!(strip.right_neighbour(follower), Some(b));
+    }
+
+    #[test]
+    fn test_shift_origin_after_left_removal() {
+        // Enough off-screen left strip: shifts by the full removed width.
+        assert_eq!(shift_origin_after_left_removal(-800, 500, 0, true), -300);
+        // Partial off-screen left strip in edge-invariant mode: clamps at viewport min x.
+        assert_eq!(shift_origin_after_left_removal(-200, 500, 0, true), 0);
+        // Leftmost column closed when clamped: stays pinned at viewport min x.
+        assert_eq!(shift_origin_after_left_removal(0, 500, 0, true), 0);
+        // Strip already scrolled past viewport min x (e.g. continuous swipe): neither snaps left nor widens the gap.
+        assert_eq!(shift_origin_after_left_removal(150, 500, 0, true), 150);
+        // Unclamped (auto_center or ManualStripOffset): preserves exact screen x.
+        assert_eq!(shift_origin_after_left_removal(-238, 500, 0, false), 262);
+        // Secondary displays with non-zero viewport origins clamp to their own min x.
+        assert_eq!(shift_origin_after_left_removal(1600, 500, 1920, true), 1920);
+        assert_eq!(
+            shift_origin_after_left_removal(-2420, 500, -1920, true),
+            -1920
+        );
+    }
+
+    #[test]
+    fn test_resolve_column_prefers_active_tab_and_skips_stale_members() {
+        let mut world = World::new();
+        let tab_top = world.spawn_empty().id();
+        let tab_active = world.spawn_empty().id();
+        let stack_stale = world.spawn_empty().id();
+        let stack_live = world.spawn_empty().id();
+        let native_stale = world.spawn_empty().id();
+        let native_live = world.spawn_empty().id();
+        let single_stale = world.spawn_empty().id();
+
+        let mut strip = LayoutStrip::default();
+        strip.append_tabbed_stack(&[tab_top, tab_active], tab_active);
+        strip.append(stack_stale);
+        strip.append(stack_live);
+        strip.stack(stack_live).unwrap();
+        strip.append_tab_group(&[native_stale, native_live]);
+        strip.append(single_stale);
+
+        let columns: Vec<_> = strip.columns().collect();
+
+        // Tabbed-display stack: prefers the active tab even when `top()` also resolves.
+        let resolved = strip.resolve_column(columns[0], |entity| match entity {
+            e if e == tab_top => Some(100),
+            e if e == tab_active => Some(400),
+            _ => None,
+        });
+        assert_eq!(resolved, Some(400));
+
+        // Tabbed-display stack: falls back to a surviving member when the active tab is stale.
+        let resolved =
+            strip.resolve_column(columns[0], |entity| (entity == tab_top).then_some(100));
+        assert_eq!(resolved, Some(100));
+
+        // Plain stack: falls back to a lower member when `top()` is stale.
+        let resolved =
+            strip.resolve_column(columns[1], |entity| (entity == stack_live).then_some(250));
+        assert_eq!(resolved, Some(250));
+
+        // Native tab group: falls back to a surviving tab when `top()` is stale.
+        let resolved =
+            strip.resolve_column(columns[2], |entity| (entity == native_live).then_some(300));
+        assert_eq!(resolved, Some(300));
+
+        // Single stale column: resolves to None so callers skip it.
+        assert_eq!(
+            strip.resolve_column(columns[3], |_| Option::<i32>::None),
+            None
+        );
     }
 }

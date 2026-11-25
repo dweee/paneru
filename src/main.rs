@@ -22,9 +22,11 @@ mod lua;
 mod manager;
 mod menubar;
 mod overlay;
+mod overview;
 mod pasteboard;
 mod platform;
 mod reader;
+mod screen_capture;
 mod tab_indicator;
 mod util;
 
@@ -169,6 +171,11 @@ pub enum QueryCmd {
     },
     /// Prints the virtual workspace list.
     VirtualWorkspaces {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Prints the native macOS Desktops / Spaces list across displays.
+    Desktops {
         #[arg(long)]
         json: bool,
     },
@@ -320,6 +327,7 @@ impl QueryCmd {
         match self {
             QueryCmd::State { json: _ } => StateQueryKind::State,
             QueryCmd::VirtualWorkspaces { json: _ } => StateQueryKind::VirtualWorkspaces,
+            QueryCmd::Desktops { json: _ } => StateQueryKind::Desktops,
             QueryCmd::Active { json: _ } => StateQueryKind::Active,
             QueryCmd::OnScreen { json: _ } => StateQueryKind::OnScreen,
         }

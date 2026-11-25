@@ -442,6 +442,15 @@ impl Config {
     /// # Returns
     ///
     /// A `Vec<WindowParams>` containing all matching window rules.
+    /// Whether any configured `[windows.<rule>]` specifies a `desktop` placement target.
+    #[must_use]
+    pub fn has_desktop_window_rules(&self) -> bool {
+        self.inner()
+            .windows
+            .as_ref()
+            .is_some_and(|windows| windows.values().any(|params| params.desktop.is_some()))
+    }
+
     pub fn find_window_properties(
         &self,
         title: &str,
@@ -590,6 +599,38 @@ impl Config {
         let distance_cm = gesture.and_then(|g| g.page_distance_cm).unwrap_or(2.0);
         let haptics = gesture.and_then(|g| g.haptics).unwrap_or(true);
         (paging, fingers, direction, distance_cm, haptics)
+    }
+
+    /// Finger count for the overview gesture, if enabled and distinct from
+    /// the window-swipe count.
+    pub fn overview_gesture_fingers(&self) -> Option<usize> {
+        let config = self.inner();
+        config
+            .swipe
+            .as_ref()
+            .and_then(|swipe| swipe.gesture.as_ref())
+            .and_then(|gesture| gesture.overview_fingers)
+            .filter(|fingers| *fingers >= 3 && Some(*fingers) != self.swipe_gesture_fingers())
+    }
+
+    /// Most windows streaming live in the overview at once.
+    pub fn overview_live_previews(&self) -> usize {
+        self.inner()
+            .overview
+            .as_ref()
+            .and_then(|o| o.live_previews)
+            .unwrap_or(4)
+    }
+
+    /// See [`OverviewOptions::live_margin`].
+    pub fn overview_live_margin(&self) -> f64 {
+        self.inner()
+            .overview
+            .as_ref()
+            .and_then(|o| o.live_margin)
+            .filter(|m| m.is_finite())
+            .unwrap_or(0.0)
+            .max(0.0)
     }
 
     pub fn swipe_vertical(&self) -> bool {
@@ -1232,6 +1273,20 @@ struct InnerConfig {
     swipe: Option<swipe::SwipeOptions>,
     padding: Option<padding::PaddingOptions>,
     restore: Option<RestoreOptions>,
+    overview: Option<OverviewOptions>,
+}
+
+/// `[overview]`: the niri-style overview.
+#[derive(Deserialize, Debug, Default, Clone)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub struct OverviewOptions {
+    /// How many windows show live (streamed) previews at once; the others
+    /// show snapshots. 0 turns live previews off. Default: 4.
+    pub live_previews: Option<usize>,
+    /// How far past the screen edge (as a fraction of the display height)
+    /// a card keeps streaming, so cards scrolled just out of view don't
+    /// stop and restart. Default: 0.
+    pub live_margin: Option<f64>,
 }
 
 impl InnerConfig {
@@ -1560,6 +1615,100 @@ width = 0.5
     assert_eq!(width.ratio(Some(0.25)), 0.5);
 }
 
+#[test]
+fn test_window_desktop_rule_config() {
+    let config = Config::try_from(
+        r#"
+[windows.slack]
+title = "Slack"
+desktop = 2
+
+[windows.pip]
+title = "PiP"
+desktop = "all"
+"#,
+    )
+    .expect("desktop window rules parse");
+
+    let slack = config.find_window_properties("Slack", "", None, None);
+    assert_eq!(
+        slack[0].desktop,
+        Some(DesktopRuleTarget::Number(
+            std::num::NonZeroU32::new(2).unwrap()
+        ))
+    );
+    let pip = config.find_window_properties("PiP", "", None, None);
+    assert_eq!(pip[0].desktop, Some(DesktopRuleTarget::All));
+
+    assert!(
+        Config::try_from("[windows.bad]\ntitle = \".*\"\ndesktop = 0\n").is_err(),
+        "desktop = 0 must be rejected"
+    );
+    assert!(
+        Config::try_from("[windows.bad]\ntitle = \".*\"\ndesktop = \"current\"\n").is_err(),
+        "unknown desktop string must be rejected"
+    );
+}
+
+/// Target Desktop placement in a `[windows.<rule>]` entry (`desktop = 2` or `desktop = "all"`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DesktopRuleTarget {
+    Number(std::num::NonZeroU32),
+    All,
+}
+
+impl<'de> Deserialize<'de> for DesktopRuleTarget {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct DesktopRuleVisitor;
+
+        impl de::Visitor<'_> for DesktopRuleVisitor {
+            type Value = DesktopRuleTarget;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a 1-based desktop integer (>= 1) or \"all\"")
+            }
+
+            fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Self::Value, E> {
+                u32::try_from(v)
+                    .ok()
+                    .and_then(std::num::NonZeroU32::new)
+                    .map(DesktopRuleTarget::Number)
+                    .ok_or_else(|| E::custom("desktop number must be >= 1"))
+            }
+
+            fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Self::Value, E> {
+                u64::try_from(v)
+                    .ok()
+                    .ok_or_else(|| E::custom("desktop number must be >= 1"))
+                    .and_then(|u| self.visit_u64(u))
+            }
+
+            fn visit_f64<E: de::Error>(self, v: f64) -> std::result::Result<Self::Value, E> {
+                if v.is_finite() && v >= 1.0 && v.fract() == 0.0 && v <= f64::from(u32::MAX) {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    self.visit_u64(v as u64)
+                } else {
+                    Err(E::custom("desktop number must be an integer >= 1"))
+                }
+            }
+
+            fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Self::Value, E> {
+                match v {
+                    "all" => Ok(DesktopRuleTarget::All),
+                    _ => Err(E::custom(format!(
+                        "invalid desktop rule {v:?}: expected >= 1 or \"all\""
+                    ))),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(DesktopRuleVisitor)
+    }
+}
+
 /// `WindowParams` defines rules and properties for specific windows based on their title or bundle ID.
 /// These parameters can override default window management behavior, such as forcing a window to float or setting its initial index.
 #[derive(Clone, Debug, Deserialize)]
@@ -1581,6 +1730,8 @@ pub struct WindowParams {
     pub manage: Option<bool>,
     /// An optional preferred index for the window's position in the window strip.
     pub index: Option<usize>,
+    /// Native macOS Desktop placement when the window spawns (`2` or `"all"`).
+    pub desktop: Option<DesktopRuleTarget>,
     pub vertical_padding: Option<i32>,
     pub horizontal_padding: Option<i32>,
     pub dont_focus: Option<bool>,
@@ -1615,6 +1766,7 @@ impl WindowParams {
             floating: None,
             manage: None,
             index: None,
+            desktop: None,
             vertical_padding: None,
             horizontal_padding: None,
             dont_focus: None,
@@ -2375,6 +2527,18 @@ window_virtualsendnum_3 = "cmd + alt + shift - 3"
 }
 
 #[test]
+fn test_overview_binding() {
+    let config = Config::try_from("[bindings]\noverview = \"alt - o\"\n").expect("parses");
+    let keycode = virtual_keycode()
+        .find_map(|(s, v)| (*s == "o").then_some(*v))
+        .unwrap();
+    assert!(matches!(
+        config.find_keybind(keycode, Modifiers::ALT),
+        Some(Command::Overview)
+    ));
+}
+
+#[test]
 fn test_parse_resize_commands() {
     assert!(matches!(
         parse_command(&["window", "resize"]).unwrap(),
@@ -2483,6 +2647,7 @@ fn test_grid_ratios() {
         floating: None,
         manage: None,
         index: None,
+        desktop: None,
         vertical_padding: None,
         horizontal_padding: None,
         dont_focus: None,
@@ -3027,4 +3192,24 @@ fn gesture_page_distance_rejects_nonpositive_and_nonfinite_values() {
             "accepted {value}"
         );
     }
+}
+
+#[test]
+#[allow(clippy::float_cmp)]
+fn test_overview_live_preview_config() {
+    let defaults = Config::try_from("").expect("empty config parses");
+    assert_eq!(defaults.overview_live_previews(), 4);
+    assert_eq!(defaults.overview_live_margin(), 0.0);
+    let config = Config::try_from(
+        r"
+[overview]
+live_previews = 7
+live_margin = 0.5
+",
+    )
+    .expect("overview section parses");
+    assert_eq!(config.overview_live_previews(), 7);
+    assert_eq!(config.overview_live_margin(), 0.5);
+    let negative = Config::try_from("[overview]\nlive_margin = -1.0\n").expect("parses");
+    assert_eq!(negative.overview_live_margin(), 0.0);
 }

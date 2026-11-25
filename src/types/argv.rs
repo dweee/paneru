@@ -5,8 +5,8 @@
 //! together here and are checked against each other by round-trip tests.
 
 use crate::types::commands::{
-    Command, Direction, MouseMove, MoveFocus, Operation, ResizeDirection,
-    parse_virtual_workspace_number,
+    Command, DesktopAssignTarget, DesktopOperation, DesktopPinTarget, DesktopTarget, Direction,
+    MouseMove, MoveFocus, Operation, ResizeDirection, parse_virtual_workspace_number,
 };
 
 /// Why an argv vector is not a command. Consumers wrap this in their own error
@@ -45,11 +45,13 @@ pub fn parse_command(argv: &[&str]) -> Result<Command> {
     Ok(match command {
         "printstate" => Command::PrintState,
         "window" => Command::Window(parse_operation(&argv[1..])?),
+        "desktop" => Command::Desktop(parse_desktop_operation(&argv[1..])?),
         "mouse" => Command::Mouse(parse_mouse_move(&argv[1..])?),
         "quit" => Command::Quit,
         "restart" => Command::Restart,
         "showmenu" if argv.len() == 1 => Command::MenuBar(true),
         "hidemenu" if argv.len() == 1 => Command::MenuBar(false),
+        "overview" if argv.len() == 1 => Command::Overview,
         _ => return Err(ParseError::new(format!("unhandled command '{argv:?}'"))),
     })
 }
@@ -162,6 +164,116 @@ fn parse_mouse_move(argv: &[&str]) -> Result<MouseMove> {
     }
 }
 
+fn parse_desktop_number(input: &str) -> Result<u32> {
+    let number = input
+        .parse::<u32>()
+        .map_err(|_| ParseError::new(format!("invalid desktop target '{input}'")))?;
+    if number == 0 {
+        return Err(ParseError::new("desktop numbers start at 1"));
+    }
+    Ok(number)
+}
+
+fn parse_desktop_target(argv: &[&str]) -> Result<DesktopTarget> {
+    match argv {
+        ["id", raw] => {
+            let space_id = raw
+                .parse::<u64>()
+                .ok()
+                .filter(|&id| id > 0)
+                .ok_or_else(|| ParseError::new(format!("invalid space id '{raw}'")))?;
+            Ok(DesktopTarget::SpaceId(space_id))
+        }
+        [target] => parse_desktop_step_or_number(target, None),
+        [target, "display", disp] => {
+            parse_desktop_step_or_number(target, Some(parse_display_id(disp)?))
+        }
+        _ => Err(ParseError::invalid(argv)),
+    }
+}
+
+fn parse_desktop_step_or_number(target: &str, display: Option<u32>) -> Result<DesktopTarget> {
+    if target.bytes().all(|b| b.is_ascii_digit()) && !target.is_empty() {
+        Ok(DesktopTarget::Number {
+            number: parse_desktop_number(target)?,
+            display,
+        })
+    } else {
+        Ok(DesktopTarget::Direction {
+            direction: Direction::parse(target)?,
+            display,
+        })
+    }
+}
+
+fn parse_desktop_operation(argv: &[&str]) -> Result<DesktopOperation> {
+    let verb = *argv.first().unwrap_or(&"");
+    let rest = argv.get(1..).unwrap_or(&[]);
+    Ok(match verb {
+        "focus" => DesktopOperation::Focus(parse_desktop_target(rest)?),
+        "move" => DesktopOperation::MoveWindow {
+            target: parse_desktop_target(rest)?,
+            move_focus: MoveFocus::Follow,
+        },
+        "send" => DesktopOperation::MoveWindow {
+            target: parse_desktop_target(rest)?,
+            move_focus: MoveFocus::Stay,
+        },
+        "create" => match rest {
+            [] => DesktopOperation::Create { focus: false },
+            ["focus"] => DesktopOperation::Create { focus: true },
+            _ => return Err(ParseError::invalid(argv)),
+        },
+        "destroy" => match rest {
+            [] => DesktopOperation::Destroy {
+                target: None,
+                empty_only: false,
+            },
+            ["empty"] => DesktopOperation::Destroy {
+                target: None,
+                empty_only: true,
+            },
+            [target_args @ .., "empty"] => DesktopOperation::Destroy {
+                target: Some(parse_desktop_target(target_args)?),
+                empty_only: true,
+            },
+            target_args => DesktopOperation::Destroy {
+                target: Some(parse_desktop_target(target_args)?),
+                empty_only: false,
+            },
+        },
+        "reorder" => DesktopOperation::Reorder(parse_desktop_target(rest)?),
+        "swap" => DesktopOperation::Swap(parse_desktop_target(rest)?),
+        "pin" => match rest {
+            ["all"] => DesktopOperation::Pin(DesktopPinTarget::All),
+            _ => DesktopOperation::Pin(DesktopPinTarget::Desktop(parse_desktop_target(rest)?)),
+        },
+        "unpin" if rest.is_empty() => DesktopOperation::Unpin,
+        "assign" => {
+            let (target_args, pid) = match rest {
+                [head @ .., "pid", pid_str] => {
+                    let pid = pid_str
+                        .parse::<i32>()
+                        .ok()
+                        .filter(|&p| p > 0)
+                        .ok_or_else(|| ParseError::new(format!("invalid pid '{pid_str}'")))?;
+                    (head, Some(pid))
+                }
+                all => (all, None),
+            };
+            let target = match target_args {
+                [mode] => DesktopAssignTarget::parse_mode(mode).map_or_else(
+                    || parse_desktop_target(target_args).map(DesktopAssignTarget::Desktop),
+                    Ok,
+                )?,
+                other => DesktopAssignTarget::Desktop(parse_desktop_target(other)?),
+            };
+            DesktopOperation::Assign { target, pid }
+        }
+        _ => return Err(ParseError::invalid(argv)),
+    })
+}
+
 impl Command {
     /// The argv encoding of this command, as understood by [`parse_command`].
     ///
@@ -173,6 +285,11 @@ impl Command {
             Command::Window(operation) => {
                 let mut argv = vec!["window".to_string()];
                 argv.extend(operation.to_argv());
+                argv
+            }
+            Command::Desktop(operation) => {
+                let mut argv = vec!["desktop".to_string()];
+                operation.push_argv(&mut argv);
                 argv
             }
             Command::Mouse(MouseMove::ToNextDisplay) => {
@@ -187,6 +304,7 @@ impl Command {
             Command::MenuBar(enabled) => {
                 vec![if *enabled { "showmenu" } else { "hidemenu" }.to_string()]
             }
+            Command::Overview => vec!["overview".to_string()],
             Command::Lua(_) | Command::Layout(_) => return None,
         };
         Some(argv)
@@ -250,6 +368,95 @@ impl Operation {
             Operation::RaiseFloating => owned(&["raise", "floating"]),
             Operation::ToggleFloatingLayer => owned(&["togglefloatlayer"]),
             Operation::CopyRule => owned(&["copyrule"]),
+        }
+    }
+}
+
+impl DesktopTarget {
+    fn push_argv(&self, out: &mut Vec<String>) {
+        match self {
+            DesktopTarget::SpaceId(id) => {
+                out.push("id".to_string());
+                out.push(id.to_string());
+            }
+            DesktopTarget::Direction { direction, display } => {
+                out.push(direction.token());
+                if let Some(disp) = display {
+                    out.push("display".to_string());
+                    out.push(disp.to_string());
+                }
+            }
+            DesktopTarget::Number { number, display } => {
+                out.push(number.to_string());
+                if let Some(disp) = display {
+                    out.push("display".to_string());
+                    out.push(disp.to_string());
+                }
+            }
+        }
+    }
+}
+
+impl DesktopOperation {
+    fn push_argv(&self, out: &mut Vec<String>) {
+        match self {
+            DesktopOperation::Focus(target) => {
+                out.push("focus".to_string());
+                target.push_argv(out);
+            }
+            DesktopOperation::MoveWindow { target, move_focus } => {
+                let verb = match move_focus {
+                    MoveFocus::Follow => "move",
+                    MoveFocus::Stay => "send",
+                };
+                out.push(verb.to_string());
+                target.push_argv(out);
+            }
+            DesktopOperation::Create { focus } => {
+                out.push("create".to_string());
+                if *focus {
+                    out.push("focus".to_string());
+                }
+            }
+            DesktopOperation::Destroy { target, empty_only } => {
+                out.push("destroy".to_string());
+                if let Some(target) = target {
+                    target.push_argv(out);
+                }
+                if *empty_only {
+                    out.push("empty".to_string());
+                }
+            }
+            DesktopOperation::Reorder(target) => {
+                out.push("reorder".to_string());
+                target.push_argv(out);
+            }
+            DesktopOperation::Swap(target) => {
+                out.push("swap".to_string());
+                target.push_argv(out);
+            }
+            DesktopOperation::Pin(DesktopPinTarget::All) => {
+                out.push("pin".to_string());
+                out.push("all".to_string());
+            }
+            DesktopOperation::Pin(DesktopPinTarget::Desktop(target)) => {
+                out.push("pin".to_string());
+                target.push_argv(out);
+            }
+            DesktopOperation::Unpin => out.push("unpin".to_string()),
+            DesktopOperation::Assign { target, pid } => {
+                out.push("assign".to_string());
+                match target {
+                    DesktopAssignTarget::All => out.push("all".to_string()),
+                    DesktopAssignTarget::This => out.push("this".to_string()),
+                    DesktopAssignTarget::None => out.push("none".to_string()),
+                    DesktopAssignTarget::Desktop(t) => t.push_argv(out),
+                }
+                if let Some(pid) = pid {
+                    out.push("pid".to_string());
+                    out.push(pid.to_string());
+                }
+            }
         }
     }
 }
@@ -322,6 +529,7 @@ mod tests {
             Command::PrintState,
             Command::MenuBar(true),
             Command::MenuBar(false),
+            Command::Overview,
             Command::Mouse(MouseMove::ToNextDisplay),
             Command::Mouse(MouseMove::ToDisplay(3)),
         ] {
@@ -356,6 +564,91 @@ mod tests {
             "the first window is number 1"
         );
         assert!(Direction::parse_positional("0").is_err());
+    }
+
+    #[test]
+    fn desktop_commands_round_trip_and_reject_zero_numbers() {
+        let operations = [
+            DesktopOperation::Focus(DesktopTarget::Direction {
+                direction: Direction::East,
+                display: None,
+            }),
+            DesktopOperation::Focus(DesktopTarget::Number {
+                number: 2,
+                display: None,
+            }),
+            DesktopOperation::Focus(DesktopTarget::Number {
+                number: 3,
+                display: Some(2),
+            }),
+            DesktopOperation::Focus(DesktopTarget::SpaceId(42)),
+            DesktopOperation::MoveWindow {
+                target: DesktopTarget::Direction {
+                    direction: Direction::West,
+                    display: None,
+                },
+                move_focus: MoveFocus::Follow,
+            },
+            DesktopOperation::MoveWindow {
+                target: DesktopTarget::Number {
+                    number: 1,
+                    display: None,
+                },
+                move_focus: MoveFocus::Stay,
+            },
+            DesktopOperation::Create { focus: false },
+            DesktopOperation::Create { focus: true },
+            DesktopOperation::Destroy {
+                target: None,
+                empty_only: false,
+            },
+            DesktopOperation::Destroy {
+                target: None,
+                empty_only: true,
+            },
+            DesktopOperation::Destroy {
+                target: Some(DesktopTarget::Number {
+                    number: 2,
+                    display: None,
+                }),
+                empty_only: true,
+            },
+            DesktopOperation::Reorder(DesktopTarget::Number {
+                number: 2,
+                display: None,
+            }),
+            DesktopOperation::Swap(DesktopTarget::Direction {
+                direction: Direction::East,
+                display: None,
+            }),
+            DesktopOperation::Pin(DesktopPinTarget::All),
+            DesktopOperation::Pin(DesktopPinTarget::Desktop(DesktopTarget::Number {
+                number: 2,
+                display: None,
+            })),
+            DesktopOperation::Unpin,
+            DesktopOperation::Assign {
+                target: DesktopAssignTarget::All,
+                pid: None,
+            },
+            DesktopOperation::Assign {
+                target: DesktopAssignTarget::This,
+                pid: Some(1234),
+            },
+            DesktopOperation::Assign {
+                target: DesktopAssignTarget::None,
+                pid: None,
+            },
+        ];
+
+        for op in operations {
+            let cmd = Command::Desktop(op);
+            assert_eq!(round_trip(&cmd), cmd);
+        }
+
+        assert!(parse_command(&["desktop", "focus", "0"]).is_err());
+        assert!(parse_command(&["desktop", "focus"]).is_err());
+        assert!(parse_command(&["desktop", "unpin", "extra"]).is_err());
     }
 
     #[test]

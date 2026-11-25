@@ -31,7 +31,7 @@ use crate::config::{CONFIGURATION_FILE, Config, InitialWindowWidth, WindowParams
 use crate::ecs::layout::LayoutStrip;
 use crate::ecs::state::PaneruState;
 use crate::errors::Result;
-use crate::events::{Event, EventSender, InputEvent};
+use crate::events::{Event, EventSender, InputEvent, OverviewEvent};
 #[cfg(feature = "lua")]
 use crate::lua;
 use crate::manager::{
@@ -40,11 +40,13 @@ use crate::manager::{
 use crate::overlay::{FlashMessageManager, OverlayManager, TabIndicatorManager};
 use crate::platform::{Modifiers, PlatformCallbacks, WinID, WorkspaceId};
 
+pub mod desktop;
 pub mod display;
 pub mod focus;
 pub mod layout;
 pub mod layout_ops;
 pub mod mouse;
+pub mod overview;
 pub mod params;
 pub(crate) mod restore;
 pub mod script_state;
@@ -267,6 +269,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
     // Registered with `add_message`, not `init_resource`, so the buffer is
     // double-buffered and dropped after a frame like any other message stream.
     app.add_message::<InputEvent>();
+    app.add_message::<OverviewEvent>();
     // Sample Bevy time after the blocking OS wait, so this frame uses its own
     // elapsed interval rather than the previous frame's sleep.
     app.add_systems(First, systems::pump_events.in_set(FirstSet::Pump));
@@ -371,6 +374,7 @@ pub fn register_systems(app: &mut bevy::app::App) {
                 crate::menubar::menu_bar_dirty
                     .or_eager(crate::menubar::menu_viewport_dirty)
                     .or_eager(resource_changed::<Config>)
+                    .or_eager(resource_changed::<desktop::DesktopCensus>)
                     .or_eager(resource_changed::<crate::menubar::MenuBarVisibility>),
             ),
             systems::update_tab_indicators.run_if(tab_indicators_dirty),
@@ -968,12 +972,18 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .insert_non_send(watcher)
         .add_plugins(mouse::MouseEventsPlugin)
         .add_plugins(scroll::ScrollEventsPlugin)
+        .add_plugins(desktop::DesktopEventsPlugin)
         .add_plugins(workspace::WorkspaceEventsPlugin)
         .add_plugins(layout::LayoutEventsPlugin)
         .add_plugins(focus::FocusEventsPlugin)
         .add_plugins(display::DisplayEventsPlugin)
         .add_plugins(setups::DisplaySetupsPlugin)
-        .add_plugins((register_triggers, register_systems, register_commands));
+        .add_plugins((
+            register_triggers,
+            register_systems,
+            register_commands,
+            overview::register_overview,
+        ));
 
     // Run every schedule inline rather than fanning systems out across the task
     // pool: the task-pool handoff measured ~45% of main-thread time against
@@ -1000,6 +1010,7 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
     crate::menubar::load_menu_bar_preference(&mut app);
     let menu_events = sender.clone();
     let tab_indicator_events = sender.clone();
+    let overview_events = sender.clone();
     let mut platform_callbacks = PlatformCallbacks::new(sender);
     let initial_config = platform_callbacks.setup_handlers()?;
     let mtm = platform_callbacks.main_thread_marker;
@@ -1010,7 +1021,18 @@ pub fn setup_bevy_app(sender: EventSender, receiver: Receiver<Event>) -> Result<
         .insert_non_send(overlay_manager)
         .insert_non_send(flash_message_manager)
         .insert_non_send(tab_indicator_manager)
+        .insert_non_send(crate::overview::view::OverviewManager::new(
+            mtm,
+            overview_events,
+        ))
         .insert_non_send(receiver);
+    if let Ok(desktop_bridge) = crate::manager::spaces::bridge::DesktopBridgeOS::new(mtm)
+        .inspect_err(|err| warn!("native desktop bridge unavailable: {err}"))
+    {
+        app.insert_non_send(crate::manager::spaces::DesktopBridge(Box::new(
+            desktop_bridge,
+        )));
+    }
 
     // `CONFIGURATION_FILE` is `None` exactly when an `init.lua` took the TOML
     // file out of play, so copied rules have to be written in Lua instead.
@@ -1089,10 +1111,17 @@ impl WindowProperties {
     }
 
     pub fn floating(&self) -> bool {
+        if matches!(self.desktop(), Some(crate::config::DesktopRuleTarget::All)) {
+            return true;
+        }
         self.params
             .iter()
             .find_map(|props| props.floating)
             .unwrap_or(false)
+    }
+
+    pub fn desktop(&self) -> Option<crate::config::DesktopRuleTarget> {
+        self.params.iter().find_map(|props| props.desktop)
     }
 
     pub fn insertion(&self) -> Option<usize> {

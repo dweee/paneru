@@ -33,7 +33,7 @@ use crate::ecs::{
     Scrolling, SendMessageTrigger, SpawnCommandsExt, SystemTheme, Unmanaged, WidthRatio,
     WindowProperties,
 };
-use crate::events::{Event, InputEvent};
+use crate::events::{Event, InputEvent, OverviewEvent};
 use crate::manager::{
     Application, Display, Origin, Process, Size, Window, WindowManager, WindowOS,
     bruteforce_windows,
@@ -862,18 +862,28 @@ pub(super) fn animate_resize_entities(
         });
 }
 
-/// Republishes the pointer and gesture events onto [`InputEvent`], so the input
-/// systems do not have to sift the whole stream for them every frame.
+/// Republishes the pointer, gesture, and overview events onto [`InputEvent`]
+/// and [`OverviewEvent`] so downstream systems do not have to sift the whole
+/// stream for them every frame.
 ///
 /// Runs right after [`pump_events`], which is what puts this frame's events on
 /// the stream in the first place.
 pub(crate) fn demux_input_events(
     mut messages: MessageReader<Event>,
     mut input: MessageWriter<InputEvent>,
+    mut overview: MessageWriter<OverviewEvent>,
+    overview_phase: Option<Res<crate::ecs::overview::OverviewPhase>>,
 ) {
+    let mut overview_active = overview_phase.is_some_and(|phase| phase.is_active());
     for event in messages.read() {
         if event.is_input() {
             input.write(InputEvent(event.clone()));
+        }
+        if event.is_overview() {
+            overview_active = true;
+            overview.write(OverviewEvent(event.clone()));
+        } else if overview_active && event.invalidates_overview() {
+            overview.write(OverviewEvent(event.clone()));
         }
     }
 }
@@ -956,6 +966,9 @@ pub(crate) fn pump_events(
         *timeout = next_pump_timeout(*timeout, timeout_limit);
         if let Some(restore_ms) = crate::manager::next_enhanced_ui_restore_timeout_ms() {
             *timeout = (*timeout).min(restore_ms);
+        }
+        if let Some(desktop_poll_ms) = activity.desktop_poll_timeout_ms() {
+            *timeout = (*timeout).min(desktop_poll_ms);
         }
     } else {
         // Still backed up: come straight back rather than sleeping on it.

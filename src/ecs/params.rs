@@ -212,6 +212,8 @@ pub struct FrameActivity<'w, 's> {
     resizing: Query<'w, 's, (), With<ResizeMarker>>,
     scrolling: Query<'w, 's, (), With<Scrolling>>,
     flash_messages: Query<'w, 's, (), With<FlashMessage>>,
+    overview: Option<bevy::ecs::system::NonSend<'w, crate::overview::view::OverviewManager>>,
+    pending_desktop_ops: Option<Res<'w, crate::ecs::desktop::PendingDesktopOps>>,
 }
 
 impl FrameActivity<'_, '_> {
@@ -222,6 +224,21 @@ impl FrameActivity<'_, '_> {
             || !self.resizing.is_empty()
             || !self.scrolling.is_empty()
             || !self.flash_messages.is_empty()
+            || self
+                .overview
+                .as_ref()
+                .is_some_and(|overview| overview.has_pending_deadline())
+    }
+
+    /// Maximum event-pump sleep (in ms) while waiting for an async `WMBridge`
+    /// desktop mutation to confirm.
+    pub fn desktop_poll_timeout_ms(&self) -> Option<u32> {
+        self.pending_desktop_ops
+            .as_ref()
+            .is_some_and(|pending| !pending.is_empty())
+            .then_some(
+                u32::try_from(crate::ecs::desktop::DESKTOP_POLL_INTERVAL.as_millis()).unwrap_or(50),
+            )
     }
 }
 

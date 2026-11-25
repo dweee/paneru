@@ -9,7 +9,9 @@ use bevy::ecs::observer::On;
 use bevy::ecs::query::{Added, Changed, Has, With, Without};
 use bevy::ecs::schedule::IntoScheduleConfigs as _;
 use bevy::ecs::schedule::common_conditions::{not, resource_exists};
-use bevy::ecs::system::{Commands, Local, ParamSet, Populated, Query, Res, ResMut, Single};
+use bevy::ecs::system::{
+    Commands, Local, NonSend, ParamSet, Populated, Query, Res, ResMut, Single, SystemParam,
+};
 use bevy::ecs::world::World;
 use bevy::time::common_conditions::on_timer;
 use std::collections::HashSet;
@@ -243,7 +245,7 @@ pub(crate) struct SnapStripMarker {
 /// shortly after a switch still animates normally.
 const SNAP_STRIP_GUARD_TIMEOUT: Duration = Duration::from_millis(500);
 
-fn spawn_snap_strip_guard(strip: Entity, commands: &mut Commands) {
+pub(crate) fn spawn_snap_strip_guard(strip: Entity, commands: &mut Commands) {
     let timeout = Timeout::new(SNAP_STRIP_GUARD_TIMEOUT, None, commands);
     commands.spawn((timeout, SnapStripMarker { strip }));
 }
@@ -278,86 +280,240 @@ fn fullscreen_window_in_strip(
         })
 }
 
-#[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
-fn workspace_change_handler(
-    mut messages: MessageReader<Event>,
-    windows: Windows,
-    mut workspaces: Query<(
-        &mut LayoutStrip,
+type ChangeableWorkspaces<'w, 's> = Query<
+    'w,
+    's,
+    (
+        &'static mut LayoutStrip,
         Entity,
         Has<ActiveWorkspaceMarker>,
         Has<SelectedVirtualMarker>,
-    )>,
-    active_display: Single<(&Display, Entity), With<ActiveDisplayMarker>>,
+        Option<&'static ChildOf>,
+    ),
+>;
+
+#[derive(SystemParam)]
+pub(crate) struct MovedWindowGuards<'w, 's> {
+    sticky_windows: Query<'w, 's, (), With<crate::ecs::desktop::StickyWindowMarker>>,
+    desktop_bridge: Option<NonSend<'w, crate::manager::spaces::DesktopBridge>>,
+    reconcile_state: Option<Res<'w, crate::ecs::display::DisplayReconcileState>>,
+}
+
+fn active_space_for_display(
+    display_id: objc2_core_graphics::CGDirectDisplayID,
+    census: Option<&crate::ecs::desktop::DesktopCensus>,
+    window_manager: &WindowManager,
+) -> Option<WorkspaceId> {
+    census
+        .and_then(|c| c.active_space(display_id))
+        .or_else(|| window_manager.active_display_space(display_id).ok())
+}
+
+fn is_space_fullscreen(
+    display_id: objc2_core_graphics::CGDirectDisplayID,
+    space_id: WorkspaceId,
+    census: Option<&crate::ecs::desktop::DesktopCensus>,
+    window_manager: &WindowManager,
+) -> bool {
+    census
+        .and_then(|c| {
+            crate::manager::spaces::SpaceId::new(space_id)
+                .and_then(|sid| c.0.find_space(sid))
+                .map(|rec| rec.kind.is_fullscreen())
+        })
+        .unwrap_or_else(|| window_manager.is_fullscreen_space(display_id))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_fullscreen_strip(
+    old_strip_entity: Entity,
+    old_strip: &mut LayoutStrip,
+    fullscreen_window: Entity,
+    space_id: WorkspaceId,
+    display: (Entity, &Display),
+    selected: bool,
+    commands: &mut Commands,
+) -> Option<Entity> {
+    let original_index = old_strip.index_of(fullscreen_window).ok()?;
+    let marker = NativeFullscreenMarker {
+        layout_strip: old_strip_entity,
+        workspace_id: old_strip.id(),
+        index: original_index,
+    };
+    old_strip.remove(fullscreen_window);
+    let mut spawned = commands.spawn((
+        Position(display.1.bounds().min),
+        marker,
+        LayoutStrip::fullscreen(space_id, fullscreen_window),
+        ChildOf(display.0),
+    ));
+    if selected {
+        spawned.insert(SelectedVirtualMarker);
+    }
+    Some(spawned.id())
+}
+
+fn reconcile_secondary_displays(
+    displays: &Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
+    workspaces: &mut ChangeableWorkspaces,
+    windows: &Windows,
+    census: Option<&crate::ecs::desktop::DesktopCensus>,
+    window_manager: &WindowManager,
+    commands: &mut Commands,
+) {
+    for (display, display_entity, is_active_display) in displays {
+        if is_active_display {
+            continue;
+        }
+        let Some(sec_space_id) = active_space_for_display(display.id(), census, window_manager)
+        else {
+            continue;
+        };
+        let best = workspaces
+            .iter()
+            .filter(|(strip, _, _, _, _)| strip.id() == sec_space_id)
+            .min_by_key(|(strip, _, _, selected, _)| (!*selected, strip.virtual_index))
+            .map(|(_, entity, _, selected, _)| (entity, selected));
+        match best {
+            Some((strip_entity, false)) => {
+                if let Ok(mut ec) = commands.get_entity(strip_entity) {
+                    ec.try_insert(SelectedVirtualMarker);
+                }
+            }
+            None if is_space_fullscreen(display.id(), sec_space_id, census, window_manager) => {
+                let candidate = window_manager
+                    .windows_in_workspace(sec_space_id)
+                    .ok()
+                    .and_then(|space_wids| {
+                        workspaces
+                            .iter()
+                            .filter(|(strip, _, _, _, child)| {
+                                !strip.is_fullscreen()
+                                    && child.is_some_and(|c| c.parent() == display_entity)
+                            })
+                            .find_map(|(strip, entity, _, _, _)| {
+                                let fs_win = space_wids.iter().find_map(|&wid| {
+                                    let (_, win_entity) = windows.find_managed(wid)?;
+                                    strip.contains(win_entity).then_some(win_entity)
+                                })?;
+                                Some((entity, fs_win))
+                            })
+                    });
+                if let Some((old_entity, fs_win)) = candidate
+                    && let Ok((mut old_strip, _, _, _, _)) = workspaces.get_mut(old_entity)
+                {
+                    spawn_fullscreen_strip(
+                        old_entity,
+                        &mut old_strip,
+                        fs_win,
+                        sec_space_id,
+                        (display_entity, display),
+                        true,
+                        commands,
+                    );
+                }
+            }
+            Some((_, true)) | None => {}
+        }
+    }
+}
+
+#[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
+pub(crate) fn workspace_change_handler(
+    mut messages: MessageReader<Event>,
+    windows: Windows,
+    mut workspaces: ChangeableWorkspaces,
+    displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
+    census: Option<Res<crate::ecs::desktop::DesktopCensus>>,
     window_manager: Res<WindowManager>,
     mut commands: Commands,
 ) {
-    if !messages
-        .read()
-        .any(|event| matches!(event, Event::SpaceChanged))
-    {
+    let triggered = messages.read().any(|event| match event {
+        Event::SpaceChanged => true,
+        Event::SpaceCurrentChanged { space_id } => {
+            debug!("space current changed: {space_id}");
+            true
+        }
+        _ => false,
+    });
+    messages.clear();
+    if !triggered {
         return;
     }
-    let (active_display, display_entity) = *active_display;
 
-    let Ok(workspace_id) = window_manager.active_display_space(active_display.id()) else {
+    reconcile_secondary_displays(
+        &displays,
+        &mut workspaces,
+        &windows,
+        census.as_deref(),
+        &window_manager,
+        &mut commands,
+    );
+
+    let Some((active_display, display_entity, _)) =
+        displays.iter().find(|(_, _, is_active)| *is_active)
+    else {
+        return;
+    };
+
+    let Some(workspace_id) =
+        active_space_for_display(active_display.id(), census.as_deref(), &window_manager)
+    else {
         error!("Unable to get active workspace id!");
         return;
     };
 
-    let mut remove_from = None;
-    let mut insert_into = None;
-    for (strip, entity, active, selected) in &workspaces {
-        if active && strip.id() == workspace_id {
-            debug!("Workspace id {} already active", strip.id());
-            return;
-        }
-        if active && strip.id() != workspace_id {
-            debug!("Workspace id {} no longer active", strip.id());
-            remove_from = Some(entity);
-        }
-        if !active && strip.id() == workspace_id && selected {
-            debug!("Workspace id {} is active", strip.id());
-            insert_into = Some(entity);
-        }
-    }
-
-    if insert_into.is_none() {
-        // Fallback: find any strip for this workspace, preferably the one with virtual_index 0.
-        insert_into = workspaces
-            .iter()
-            .filter(|(strip, _, _, _)| strip.id() == workspace_id)
-            .min_by_key(|(strip, _, _, _)| strip.virtual_index)
-            .map(|(_, entity, _, _)| entity);
-    }
+    let Ok((remove_from, best_target)) = workspaces.iter().try_fold(
+        (None, None::<(bool, u32, Entity)>),
+        |(remove_from, best), (strip, entity, active, selected, _)| {
+            if active && strip.id() == workspace_id {
+                debug!("Workspace id {} already active", strip.id());
+                return Err(());
+            }
+            let remove_from = if active {
+                debug!("Workspace id {} no longer active", strip.id());
+                Some(entity)
+            } else {
+                remove_from
+            };
+            let best = if strip.id() == workspace_id {
+                let candidate = (!selected, strip.virtual_index, entity);
+                match best {
+                    Some(prev) if (prev.0, prev.1) <= (candidate.0, candidate.1) => Some(prev),
+                    _ => Some(candidate),
+                }
+            } else {
+                best
+            };
+            Ok((remove_from, best))
+        },
+    ) else {
+        return;
+    };
+    let mut insert_into = best_target.map(|(_, _, entity)| entity);
 
     if insert_into.is_none()
         && let Some(old_space) = remove_from
-        && window_manager.is_fullscreen_space(active_display.id())
-        && let Ok((mut old_strip, old_strip_entity, _, _)) = workspaces.get_mut(old_space)
+        && is_space_fullscreen(
+            active_display.id(),
+            workspace_id,
+            census.as_deref(),
+            &window_manager,
+        )
+        && let Ok((mut old_strip, old_strip_entity, _, _, _)) = workspaces.get_mut(old_space)
         && let Some(fullscreen_window) =
             fullscreen_window_in_strip(workspace_id, &old_strip, &windows, &window_manager)
-        && let Ok(original_index) = old_strip.index_of(fullscreen_window)
     {
         debug!("workspace_change: space={workspace_id} fullscreen");
-
-        let fullscreen_marker = NativeFullscreenMarker {
-            layout_strip: old_strip_entity,
-            workspace_id: old_strip.id(),
-            index: original_index,
-        };
-        old_strip.remove(fullscreen_window);
-
-        let fullscreen_strip = LayoutStrip::fullscreen(workspace_id, fullscreen_window);
-        let entity = commands
-            .spawn((
-                Position(active_display.bounds().min),
-                fullscreen_marker,
-                fullscreen_strip,
-                ChildOf(display_entity),
-            ))
-            .id();
-        insert_into = Some(entity);
+        insert_into = spawn_fullscreen_strip(
+            old_strip_entity,
+            &mut old_strip,
+            fullscreen_window,
+            workspace_id,
+            (display_entity, active_display),
+            false,
+            &mut commands,
+        );
     }
 
     if let Some(into) = insert_into
@@ -383,8 +539,8 @@ pub(crate) fn detect_moved_windows(
         Option<&ChildOf>,
     )>,
     apps: Query<&mut Application>,
+    guards: MovedWindowGuards,
     window_manager: Res<WindowManager>,
-    reconcile_state: Option<Res<crate::ecs::display::DisplayReconcileState>>,
     mut ignored_windows: Local<HashSet<WinID>>,
     mut ctx: WindowCtx,
 ) {
@@ -450,19 +606,56 @@ pub(crate) fn detect_moved_windows(
         }
     }
 
-    if reconcile_state.is_some_and(|state| state.is_settling()) {
+    if guards
+        .reconcile_state
+        .is_some_and(|state| state.is_settling())
+    {
         return;
     }
 
-    let moved_set: bevy::ecs::entity::EntityHashSet = moved_windows
-        .iter()
-        .copied()
-        .filter(|&entity| {
-            !workspaces
+    let sticky_map = guards.desktop_bridge.as_ref().map(|bridge| {
+        let wids: Vec<WinID> = moved_windows
+            .iter()
+            .copied()
+            .filter(|&entity| !guards.sticky_windows.contains(entity))
+            .filter_map(|entity| ctx.windows.get_managed(entity).map(|(w, _, _)| w.id()))
+            .collect();
+        bridge.sticky_windows(&wids)
+    });
+    let (newly_sticky, moved_set) = moved_windows.iter().copied().fold(
+        (Vec::new(), bevy::ecs::entity::EntityHashSet::default()),
+        |(mut sticky, mut moved), entity| {
+            if guards.sticky_windows.contains(entity) {
+                return (sticky, moved);
+            }
+            if let Some((window, _, _)) = ctx.windows.get_managed(entity)
+                && sticky_map
+                    .as_ref()
+                    .and_then(|map| map.get(&window.id()).copied())
+                    == Some(true)
+            {
+                sticky.push(entity);
+                return (sticky, moved);
+            }
+            if !workspaces
                 .iter()
                 .any(|(strip, _, fullscreen, _)| fullscreen && strip.contains(entity))
-        })
-        .collect();
+            {
+                moved.insert(entity);
+            }
+            (sticky, moved)
+        },
+    );
+    for entity in newly_sticky {
+        for (mut strip, _, _, _) in &mut workspaces {
+            if strip.contains(entity) {
+                strip.remove(entity);
+            }
+        }
+        if let Ok(mut ec) = ctx.commands.get_entity(entity) {
+            ec.try_insert((crate::ecs::desktop::StickyWindowMarker, Unmanaged::Floating));
+        }
+    }
     if moved_set.is_empty() {
         return;
     }
@@ -505,7 +698,7 @@ pub(crate) fn detect_moved_windows(
         for (mut strip, strip_entity, _, _) in &mut workspaces {
             if strip_entity == *activated_workspace {
                 strip.append_relocation_group(entity, group.as_ref());
-            } else {
+            } else if moving_entities.iter().any(|&m| strip.contains(m)) {
                 for moving_entity in &moving_entities {
                     strip.remove(*moving_entity);
                 }
@@ -549,7 +742,7 @@ fn is_batch_workspace_move(
 }
 
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
-fn workspace_destroyed_handler(
+pub(crate) fn workspace_destroyed_handler(
     mut messages: MessageReader<Event>,
     mut workspaces: DestroyableStrips,
     displays: Query<&Display>,
@@ -645,23 +838,44 @@ fn workspace_destroyed_handler(
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 fn workspace_created_handler(
     mut messages: MessageReader<Event>,
-    active_display: Single<(&Display, Entity), With<ActiveDisplayMarker>>,
+    displays: Query<(&Display, Entity, Has<ActiveDisplayMarker>)>,
+    census: Option<Res<crate::ecs::desktop::DesktopCensus>>,
+    window_manager: Res<WindowManager>,
     workspaces: Query<&LayoutStrip>,
     mut commands: Commands,
 ) {
+    let mut spawned = HashSet::new();
+    let mut present_displays = None;
     for event in messages.read() {
         let Event::SpaceCreated { space_id } = &event else {
             continue;
         };
 
-        if workspaces.into_iter().any(|strip| strip.id() == *space_id) {
-            warn!("Workspace {space_id} already exists!");
+        if !spawned.insert(*space_id) || workspaces.into_iter().any(|strip| strip.id() == *space_id)
+        {
+            debug!("Workspace {space_id} already exists");
             continue;
         }
-        debug!("Workspace create {space_id}");
-        let (active_display, display_entity) = *active_display;
+        let target_display_id = census
+            .as_ref()
+            .and_then(|c| c.display_for_space(*space_id))
+            .or_else(|| {
+                present_displays
+                    .get_or_insert_with(|| window_manager.present_displays())
+                    .iter()
+                    .find(|(_, spaces)| spaces.contains(space_id))
+                    .map(|(d, _)| d.id())
+            });
+        let owner = target_display_id
+            .and_then(|id| displays.iter().find(|(d, _, _)| d.id() == id))
+            .or_else(|| displays.iter().find(|(_, _, active)| *active));
+        let Some((target_disp, display_entity, _)) = owner else {
+            continue;
+        };
+        let disp_id = target_disp.id();
+        debug!("Workspace create {space_id} on display {disp_id}");
         let strip = LayoutStrip::new(*space_id, 0);
-        let origin = active_display.bounds().min;
+        let origin = target_disp.bounds().min;
         commands.spawn_layout_strip(strip, origin, display_entity, false);
     }
 }
@@ -819,12 +1033,44 @@ fn cleanup_active_workspace_marker(
     });
 }
 
+#[derive(SystemParam)]
+struct FlashPopupContext<'w> {
+    window_manager: Res<'w, WindowManager>,
+    config: Res<'w, Config>,
+    census: Option<Res<'w, crate::ecs::desktop::DesktopCensus>>,
+}
+
+#[must_use]
+pub(crate) fn format_activation_popup_label(
+    virtual_index: u32,
+    virtual_row_count: usize,
+    display_space_count: usize,
+    desktop_number: Option<u32>,
+    is_fullscreen: bool,
+) -> String {
+    let v = virtual_index + 1;
+    if display_space_count <= 1 {
+        return v.to_string();
+    }
+    if is_fullscreen {
+        return "Fullscreen".to_string();
+    }
+    if let Some(d) = desktop_number {
+        if virtual_row_count > 1 {
+            format!("{d} · {v}")
+        } else {
+            format!("Desktop {d}")
+        }
+    } else {
+        v.to_string()
+    }
+}
+
 fn flash_workspace_on_activation(
     active_display: Single<Entity, With<ActiveDisplayMarker>>,
     displays: Query<(Entity, &Display)>,
     strips: PopupStrips,
-    window_manager: Res<WindowManager>,
-    config: Res<Config>,
+    ctx: FlashPopupContext,
     mut previous_by_display: Local<EntityHashMap<Entity>>,
     mut commands: Commands,
 ) {
@@ -833,7 +1079,7 @@ fn flash_workspace_on_activation(
         if previous_by_display.contains_key(&display_entity) {
             continue;
         }
-        let Ok(space_id) = window_manager.active_display_space(display.id()) else {
+        let Ok(space_id) = ctx.window_manager.active_display_space(display.id()) else {
             continue;
         };
         let selected = strips
@@ -870,8 +1116,32 @@ fn flash_workspace_on_activation(
         }
         return;
     }
-    if switched && config.workspace_popup_status() {
-        commands.flash_message(format!("{}", strip.virtual_index + 1), 1.0);
+    if switched && ctx.config.workspace_popup_status() {
+        let virtual_row_count = strips
+            .iter()
+            .filter(|(_, other, _, _, _, _)| other.id() == strip.id())
+            .count();
+        let display_id = displays.get(*active_display).ok().map(|(_, d)| d.id());
+        let (display_space_count, desktop_number, is_fullscreen) = ctx
+            .census
+            .as_deref()
+            .and_then(|census| display_id.and_then(|id| census.0.display(id)))
+            .map_or((0, None, false), |disp| {
+                let rec = disp.spaces.iter().find(|s| s.id.get() == strip.id());
+                (
+                    disp.spaces.len(),
+                    rec.and_then(|s| s.desktop_number),
+                    rec.is_some_and(|s| s.kind.is_fullscreen()),
+                )
+            });
+        let label = format_activation_popup_label(
+            strip.virtual_index,
+            virtual_row_count,
+            display_space_count,
+            desktop_number,
+            is_fullscreen,
+        );
+        commands.flash_message(label, 1.0);
     }
 }
 

@@ -16,13 +16,13 @@ use std::time::Duration;
 use tracing::{Level, debug, error, info, instrument, trace, warn};
 
 use super::{
-    ActiveDisplayMarker, BProcess, FocusedMarker, FreshMarker, MissionControlActive, OpenedFrom,
-    PreviousManagedStrip, RetryFrontSwitch, SelectedVirtualMarker, SpawnWindowTrigger,
-    StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
+    ActiveDisplayMarker, BProcess, FloatsWhenRestored, FocusedMarker, FreshMarker,
+    MissionControlActive, OpenedFrom, PreviousManagedStrip, RetryFrontSwitch,
+    SelectedVirtualMarker, SpawnWindowTrigger, StrayFocusEvent, SystemTheme, Timeout, Unmanaged,
 };
 use crate::config::Config;
 use crate::ecs::focus::FocusHistory;
-use crate::ecs::layout::LayoutStrip;
+use crate::ecs::layout::{DisplayViewports, LayoutStrip, RemovableStrips};
 use crate::ecs::params::{ActiveDisplay, GlobalState, WindowCtx, Windows};
 use crate::ecs::state::PaneruState;
 use crate::ecs::workspace::RestoreFocusMarker;
@@ -65,6 +65,59 @@ type WindowDefaultsQueries<'w, 's> = ParamSet<
         Query<'static, 'static, &'static WidthRatio, With<FocusedMarker>>,
     ),
 >;
+
+const MAX_WINDOW_PADDING: i32 = 50;
+
+fn clamped_window_padding(properties: &WindowProperties) -> (i32, i32) {
+    (
+        properties.horizontal_padding().clamp(0, MAX_WINDOW_PADDING),
+        properties.vertical_padding().clamp(0, MAX_WINDOW_PADDING),
+    )
+}
+
+type ManagedWindowPadding<'w, 's> = Populated<
+    'w,
+    's,
+    (
+        &'static mut Window,
+        &'static ChildOf,
+        &'static mut Position,
+        &'static mut Bounds,
+        &'static mut LayoutPosition,
+    ),
+    Without<Unmanaged>,
+>;
+
+/// Re-applies per-window `horizontal_padding` and `vertical_padding` rules to
+/// already-open managed windows whenever [`Config`] changes (TOML or Lua reload).
+///
+/// Only windows whose clamped padding actually changed are mutated or marked
+/// dirty; floating, minimized, and hidden windows are excluded (becoming tiled
+/// again re-applies padding in [`window_managed_trigger`]).
+#[instrument(level = Level::DEBUG, skip_all)]
+pub(super) fn refresh_window_padding(
+    mut windows: ManagedWindowPadding,
+    apps: Query<&Application>,
+    config: Res<Config>,
+) {
+    for (mut window, child_of, mut position, mut bounds, mut layout_position) in &mut windows {
+        let Ok(app) = apps.get(child_of.parent()) else {
+            continue;
+        };
+        let properties = WindowProperties::new(app, &window, &config);
+        let (horizontal, vertical) = clamped_window_padding(&properties);
+        if horizontal == window.horizontal_padding() && vertical == window.vertical_padding() {
+            continue;
+        }
+        window.set_padding(WindowPadding::Horizontal(horizontal));
+        window.set_padding(WindowPadding::Vertical(vertical));
+        if !window.is_full_screen() {
+            layout_position.set_changed();
+            position.set_changed();
+            bounds.set_changed();
+        }
+    }
+}
 
 /// Computes the passthrough keybinding set for the given window/app and
 /// publishes it to the input thread. Called on focus change and config reload.
@@ -417,16 +470,11 @@ pub(super) fn window_focused_trigger(
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn mission_control_trigger(
     mut messages: MessageReader<Event>,
-    windows: Windows,
-    mut workspaces: Query<(
-        Entity,
-        &mut LayoutStrip,
-        Has<ActiveWorkspaceMarker>,
-        Option<&Scrolling>,
-    )>,
+    mut workspaces: RemovableStrips,
+    displays: DisplayViewports,
     mut mission_control_active: ResMut<MissionControlActive>,
     window_manager: Res<WindowManager>,
-    mut commands: Commands,
+    mut ctx: WindowCtx,
 ) {
     for event in messages.read() {
         match event {
@@ -434,9 +482,9 @@ pub(super) fn mission_control_trigger(
             | Event::MissionControlShowFrontWindows
             | Event::MissionControlShowDesktop => {
                 mission_control_active.as_mut().0 = true;
-                for (entity, _, _, scroll) in &workspaces {
-                    if scroll.is_some()
-                        && let Ok(mut entity_commands) = commands.get_entity(entity)
+                for item in &workspaces {
+                    if item.scrolling.is_some()
+                        && let Ok(mut entity_commands) = ctx.commands.get_entity(item.entity)
                     {
                         entity_commands.try_remove::<Scrolling>();
                     }
@@ -447,31 +495,38 @@ pub(super) fn mission_control_trigger(
 
                 // Check if some windows disappeared from the current workspace
                 // - e.g. they were moved away during mission control.
-                if let Some(mut active_strip) = workspaces
-                    .iter_mut()
-                    .find_map(|(_, strip, active, _)| active.then_some(strip))
+                if let Some(mut active_strip) = workspaces.iter_mut().find(|item| item.active)
                     && let Ok(present_windows) =
-                        window_manager.windows_in_workspace(active_strip.id())
+                        window_manager.windows_in_workspace(active_strip.strip.id())
                 {
+                    let focused = ctx.windows.focused().map(|(_, focused)| focused);
                     let moved_windows = active_strip
+                        .strip
                         .all_windows()
                         .into_iter()
-                        .filter_map(|entity| windows.get(entity).zip(Some(entity)))
-                        .filter(|(window, _)| !present_windows.contains(&window.id()));
+                        .filter_map(|entity| ctx.windows.get(entity).zip(Some(entity)))
+                        .filter(|(window, _)| !present_windows.contains(&window.id()))
+                        .collect::<Vec<_>>();
                     for (window, entity) in moved_windows {
                         // A parked tab's off-screen position can look like
                         // a move to another display; ignore it.
-                        if active_strip.is_parked_tab(entity) {
+                        if active_strip.strip.is_parked_tab(entity) {
                             continue;
                         }
                         debug!(
                             "window {} {entity} moved, removing from workspace {}",
                             window.id(),
-                            active_strip.id(),
+                            active_strip.strip.id(),
                         );
                         // Simply removing them from the current strip is enough,
                         // they will be re-detected during the workspace change.
-                        active_strip.remove(entity);
+                        active_strip.remove_preserving_focus(
+                            entity,
+                            focused,
+                            &ctx.windows,
+                            &displays,
+                            &ctx.config,
+                        );
                     }
                 }
             }
@@ -578,6 +633,7 @@ pub(super) fn dispatch_application_messages(
     windows: Windows,
     applications: Query<(&Application, &Children)>,
     unmanaged_query: Query<&Unmanaged>,
+    floats_when_restored: Query<(), With<FloatsWhenRestored>>,
     mut commands: Commands,
 ) {
     let find_window = |window_id| windows.find(window_id);
@@ -588,7 +644,19 @@ pub(super) fn dispatch_application_messages(
                 if let Some((_, entity)) = find_window(*window_id)
                     && let Ok(mut entity_commands) = commands.get_entity(entity)
                 {
-                    entity_commands.try_insert(Unmanaged::Minimized);
+                    // A repeated notification keeps the marker. Any state but
+                    // floating clears one left over from an earlier minimize.
+                    match unmanaged_query.get(entity) {
+                        Ok(Unmanaged::Minimized) => {}
+                        Ok(Unmanaged::Floating) => {
+                            entity_commands.try_insert((Unmanaged::Minimized, FloatsWhenRestored));
+                        }
+                        _ => {
+                            entity_commands
+                                .try_remove::<FloatsWhenRestored>()
+                                .try_insert(Unmanaged::Minimized);
+                        }
+                    }
                 }
             }
 
@@ -597,7 +665,13 @@ pub(super) fn dispatch_application_messages(
                     && matches!(unmanaged_query.get(entity), Ok(Unmanaged::Minimized))
                     && let Ok(mut entity_commands) = commands.get_entity(entity)
                 {
-                    entity_commands.try_remove::<Unmanaged>();
+                    if floats_when_restored.contains(entity) {
+                        entity_commands
+                            .try_remove::<FloatsWhenRestored>()
+                            .try_insert(Unmanaged::Floating);
+                    } else {
+                        entity_commands.try_remove::<Unmanaged>();
+                    }
                 }
             }
 
@@ -643,7 +717,8 @@ pub(super) fn dispatch_application_messages(
 pub(super) fn window_unmanaged_trigger(
     trigger: On<Add<Unmanaged>>,
     apps: Query<(Entity, &Application)>,
-    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    mut workspaces: RemovableStrips,
+    displays: DisplayViewports,
     // `Option<Single>` rather than `Single`: an unresolvable display would skip the
     // whole observer, but the strip removal below must still run without one.
     active_display: Option<ActiveDisplayViewport>,
@@ -701,14 +776,18 @@ pub(super) fn window_unmanaged_trigger(
     // is actually looking at.
     let parked_out_of_view = workspaces
         .iter()
-        .any(|(strip, active)| !active && strip.contains(entity));
+        .any(|item| !item.active && item.strip.contains(entity));
 
     // Drop the strip membership first, before anything below can bail early —
     // a floating window still reserves column space in the strip otherwise,
     // leaving a gap that never closes on its own.
-    for (mut strip, _) in &mut workspaces {
-        if strip.contains(entity) {
-            strip.remove(entity);
+    let focused = initializing
+        .is_none()
+        .then(|| ctx.windows.focused().map(|(_, focused)| focused))
+        .flatten();
+    for mut item in &mut workspaces {
+        if item.strip.contains(entity) {
+            item.remove_preserving_focus(entity, focused, &ctx.windows, &displays, &ctx.config);
         }
     }
 
@@ -780,39 +859,42 @@ fn remember_managed_strip(entity: Entity, strip: &LayoutStrip, commands: &mut Co
 #[instrument(level = Level::DEBUG, skip_all, fields(trigger))]
 pub(super) fn window_minimized_trigger(
     trigger: On<Add<Unmanaged>>,
-    windows: Windows,
-    workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    mut workspaces: RemovableStrips,
+    displays: DisplayViewports,
     active_display: Single<&Display, With<ActiveDisplayMarker>>,
     openers: Query<&OpenedFrom>,
-    mut config: GlobalState,
-    mut commands: Commands,
+    mut global_state: GlobalState,
+    mut ctx: WindowCtx,
 ) {
     let entity = trigger.event().entity;
     if let Some((_, _, Some(Unmanaged::Minimized | Unmanaged::Hidden))) =
-        windows.get_managed(entity)
+        ctx.windows.get_managed(entity)
     {
         debug!("Entity {entity} is minimized or hidden.");
         let display_bounds = active_display.bounds();
         let opener = openers.get(entity).ok().map(|opened| opened.0);
-        if let Ok(mut entity_commands) = commands.get_entity(entity) {
+        if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
             entity_commands.try_remove::<OpenedFrom>();
         }
 
-        for (mut strip, active) in workspaces {
-            if active {
+        let focused = (!global_state.initializing())
+            .then(|| ctx.windows.focused().map(|(_, focused)| focused))
+            .flatten();
+        for mut item in &mut workspaces {
+            if item.active {
                 give_away_focus(
                     entity,
                     opener,
-                    &windows,
-                    &strip,
+                    &ctx.windows,
+                    &item.strip,
                     &display_bounds,
-                    &mut config,
-                    &mut commands,
+                    &mut global_state,
+                    &mut ctx.commands,
                 );
             }
-            if strip.contains(entity) {
-                remember_managed_strip(entity, &strip, &mut commands);
-                strip.remove(entity);
+            if item.strip.contains(entity) {
+                remember_managed_strip(entity, &item.strip, &mut ctx.commands);
+                item.remove_preserving_focus(entity, focused, &ctx.windows, &displays, &ctx.config);
             }
         }
     }
@@ -869,8 +951,7 @@ pub(super) fn window_managed_trigger(
 
         // A window that opened floating never got the padding that
         // `apply_window_defaults` gives a tiled one.
-        let vertical = properties.vertical_padding().clamp(0, 50);
-        let horizontal = properties.horizontal_padding().clamp(0, 50);
+        let (horizontal, vertical) = clamped_window_padding(&properties);
         if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
             entity_commands.queue_silenced(move |mut entity: EntityWorldMut| {
                 if let Some(mut window) = entity.get_mut::<Window>() {
@@ -936,7 +1017,9 @@ pub(super) fn window_managed_trigger(
     }
 
     if let Ok(mut entity_commands) = ctx.commands.get_entity(entity) {
-        entity_commands.try_remove::<PreviousManagedStrip>();
+        entity_commands
+            .try_remove::<PreviousManagedStrip>()
+            .try_remove::<FloatsWhenRestored>();
     }
 
     if let Some((strip_entity, false)) = landed_in {
@@ -1275,10 +1358,9 @@ pub(super) fn apply_window_defaults(
             }
             continue;
         }
-        let vpadding = properties.vertical_padding();
-        let hpadding = properties.horizontal_padding();
-        window.set_padding(WindowPadding::Vertical(vpadding.clamp(0, 50)));
-        window.set_padding(WindowPadding::Horizontal(hpadding.clamp(0, 50)));
+        let (hpadding, vpadding) = clamped_window_padding(&properties);
+        window.set_padding(WindowPadding::Vertical(vpadding));
+        window.set_padding(WindowPadding::Horizontal(hpadding));
         let display_width = f64::from(active_display.bounds().width());
         if let Ok(frame) = window.update_frame() {
             position.0 = frame.min;
@@ -1612,32 +1694,25 @@ pub(super) fn refresh_configuration_trigger(
 
 pub(super) fn window_removal_trigger(
     trigger: On<Remove<Window>>,
-    mut workspaces: Query<(&mut LayoutStrip, Has<ActiveWorkspaceMarker>)>,
+    mut workspaces: RemovableStrips,
+    displays: DisplayViewports,
     windows: Windows,
-    global_state: GlobalState,
-    mut commands: Commands,
+    initializing: Option<Res<Initializing>>,
+    config: Res<Config>,
 ) {
     let entity = trigger.event().entity;
+    let focused = initializing
+        .is_none()
+        .then(|| windows.focused().map(|(_, focused)| focused))
+        .flatten();
 
-    if let Some((mut strip, active)) = workspaces
-        .iter_mut()
-        .find(|(strip, _)| strip.contains(entity))
-    {
-        debug!(
-            "Removing despawned entity {entity} from strip {}",
-            strip.id()
-        );
-        strip.remove(entity);
-
-        // The strip's origin stays put, so closing a column left of the
-        // focused window pulls it left and can push it off screen.
-        if active
-            && !global_state.skip_reshuffle()
-            && !global_state.initializing()
-            && let Some((_, focused)) = windows.focused()
-            && strip.contains(focused)
-        {
-            commands.ensure_visible(focused);
+    for mut item in &mut workspaces {
+        if item.strip.contains(entity) {
+            debug!(
+                "Removing despawned entity {entity} from strip {}",
+                item.strip.id()
+            );
+            item.remove_preserving_focus(entity, focused, &windows, &displays, &config);
         }
     }
 }
